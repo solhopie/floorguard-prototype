@@ -243,9 +243,16 @@ function $(sel) { return document.querySelector(sel); }
 var Scanner = {
   stream: null,
   stopFlag: false,
+  zxReader: null,
 
   cameraAvailable: function () {
     return !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+  },
+
+  /* True when ANY barcode reader exists: the built-in API or our bundled ZXing. */
+  hasReader: function () {
+    return ('BarcodeDetector' in window) ||
+      !!(window.ZXing && ZXing.BrowserMultiFormatReader);
   },
 
   start: function (videoEl, onCode) {
@@ -256,7 +263,9 @@ var Scanner = {
     /* Check for a barcode-reader API BEFORE asking for the camera: without one
        the preview can't scan anything, so skip the permission prompt entirely
        instead of flashing the user's own video and then failing. */
-    if (!('BarcodeDetector' in window)) return Promise.resolve({ ok: false, reason: 'no-detector' });
+    if (!self.hasReader()) return Promise.resolve({ ok: false, reason: 'no-detector' });
+    /* No built-in reader (older iOS) but our bundled ZXing is present. */
+    if (!('BarcodeDetector' in window)) return self.startZxing(videoEl, onCode);
     return navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false })
       .then(function (stream) {
         self.stream = stream;
@@ -308,8 +317,53 @@ var Scanner = {
       .catch(function () { self.stop(); return { ok: false, reason: 'denied' }; });
   },
 
+  /* Fallback path for devices without the built-in BarcodeDetector (older iOS):
+     decode with the bundled ZXing library instead. */
+  startZxing: function (videoEl, onCode) {
+    var self = this;
+    self.stop();
+    self.stopFlag = false;
+    var reader;
+    try {
+      reader = new ZXing.BrowserMultiFormatReader();
+    } catch (e) {
+      return Promise.resolve({ ok: false, reason: 'detector-init' });
+    }
+    self.zxReader = reader;
+    var p;
+    try {
+      p = reader.decodeFromConstraints(
+        { video: { facingMode: { ideal: 'environment' } }, audio: false },
+        videoEl,
+        function (result, err) {
+          if (self.stopFlag) return;
+          if (result && result.getText) {
+            var txt = result.getText();
+            if (txt) { self.stop(); onCode(txt); }
+          }
+          /* err is routine (no barcode in this frame); ignore it. */
+        }
+      );
+    } catch (e) {
+      self.stop();
+      return Promise.resolve({ ok: false, reason: 'detector-init' });
+    }
+    return Promise.resolve(p).then(
+      function () { return { ok: true, mode: 'camera-zxing' }; },
+      function (e) {
+        self.stop();
+        var denied = e && (e.name === 'NotAllowedError' || e.name === 'NotFoundError' || e.name === 'OverconstrainedError');
+        return { ok: false, reason: denied ? 'denied' : 'detector-init' };
+      }
+    );
+  },
+
   stop: function () {
     this.stopFlag = true;
+    if (this.zxReader) {
+      try { this.zxReader.reset(); } catch (e) {}
+      this.zxReader = null;
+    }
     if (this.stream) {
       try { this.stream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
       this.stream = null;
@@ -481,10 +535,10 @@ function mountScannerBox(boxId, onCode) {
     box.innerHTML = '<div class="camnote">This device has no camera.<br>Type the code or tap a DEMO chip below.</div>';
     return;
   }
-  if (!('BarcodeDetector' in window)) {
-    /* No barcode-reader API on this device (older iOS Safari): don't prompt
-       for the camera at all — it couldn't scan anyway. Manual entry and the
-       DEMO chips are the way through. */
+  if (!Scanner.hasReader()) {
+    /* No barcode-reader API on this device and the bundled fallback failed to
+       load: don't prompt for the camera — it couldn't scan anyway. Manual
+       entry and the DEMO chips are the way through. */
     box.innerHTML = '<div class="camnote">&#9888;&#65039; Auto-scan isn\'t supported on this iPhone\'s iOS version.<br>Type the code or tap a DEMO chip below &mdash; no camera needed.</div>';
     return;
   }
