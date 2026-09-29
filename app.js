@@ -253,6 +253,10 @@ var Scanner = {
     self.stop();
     self.stopFlag = false;
     if (!self.cameraAvailable()) return Promise.resolve({ ok: false, reason: 'no-camera-api' });
+    /* Check for a barcode-reader API BEFORE asking for the camera: without one
+       the preview can't scan anything, so skip the permission prompt entirely
+       instead of flashing the user's own video and then failing. */
+    if (!('BarcodeDetector' in window)) return Promise.resolve({ ok: false, reason: 'no-detector' });
     return navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false })
       .then(function (stream) {
         self.stream = stream;
@@ -260,29 +264,48 @@ var Scanner = {
         return videoEl.play().catch(function () {});
       })
       .then(function () {
-        if (!('BarcodeDetector' in window)) return { ok: true, mode: 'manual-only', reason: 'no-detector' };
-        var det;
+        var det = null;
         try {
           det = new BarcodeDetector({ formats: ['qr_code', 'code_128', 'code_39', 'ean_13', 'ean_8', 'upc_a', 'upc_e', 'itf', 'codabar'] });
-        } catch (e) { return { ok: true, mode: 'manual-only', reason: 'detector-init' }; }
+        } catch (e1) {
+          try { det = new BarcodeDetector(); }
+          catch (e2) { self.stop(); return { ok: false, reason: 'detector-init' }; }
+        }
+        var fails = 0, hintShown = false;
         var tick = function () {
           if (self.stopFlag) return;
-          try {
-            det.detect(videoEl).then(function (codes) {
-              if (self.stopFlag) return;
-              if (codes && codes.length && codes[0].rawValue) {
-                self.stop();
-                onCode(codes[0].rawValue);
-              } else {
-                requestAnimationFrame(tick);
+          var p;
+          try { p = det.detect(videoEl); }
+          catch (e) { requestAnimationFrame(tick); return; }
+          p.then(function (codes) {
+            if (self.stopFlag) return;
+            fails = 0;
+            if (codes && codes.length && codes[0].rawValue) {
+              self.stop();
+              onCode(codes[0].rawValue);
+            } else {
+              requestAnimationFrame(tick);
+            }
+          }).catch(function () {
+            if (self.stopFlag) return;
+            fails++;
+            if (fails >= 25 && !hintShown) {
+              hintShown = true;
+              var box = videoEl.parentNode;
+              if (box) {
+                var d = document.createElement('div');
+                d.className = 'camnote';
+                d.innerHTML = 'Having trouble reading &mdash; you can type the code or tap a DEMO chip below.';
+                box.appendChild(d);
               }
-            }).catch(function () { requestAnimationFrame(tick); });
-          } catch (e) { /* keep manual entry usable */ }
+            }
+            requestAnimationFrame(tick);
+          });
         };
         tick();
         return { ok: true, mode: 'camera' };
       })
-      .catch(function () { return { ok: false, reason: 'denied' }; });
+      .catch(function () { self.stop(); return { ok: false, reason: 'denied' }; });
   },
 
   stop: function () {
@@ -455,16 +478,24 @@ Screens['scan-roll'] = function () {
 function mountScannerBox(boxId, onCode) {
   var box = document.getElementById(boxId);
   if (!Scanner.cameraAvailable()) {
-    box.innerHTML = '<div class="camnote">No camera API on this device.<br>Use manual entry below.</div>';
+    box.innerHTML = '<div class="camnote">This device has no camera.<br>Type the code or tap a DEMO chip below.</div>';
+    return;
+  }
+  if (!('BarcodeDetector' in window)) {
+    /* No barcode-reader API on this device (older iOS Safari): don't prompt
+       for the camera at all — it couldn't scan anyway. Manual entry and the
+       DEMO chips are the way through. */
+    box.innerHTML = '<div class="camnote">&#9888;&#65039; Auto-scan isn\'t supported on this iPhone\'s iOS version.<br>Type the code or tap a DEMO chip below &mdash; no camera needed.</div>';
     return;
   }
   box.innerHTML = '<video id="scanvideo" playsinline muted></video><div class="scanline"></div>';
   var video = document.getElementById('scanvideo');
   Scanner.start(video, onCode).then(function (res) {
-    if (!res.ok || res.mode !== 'camera') {
-      box.innerHTML = '<div class="camnote">Camera unavailable' +
-        (res.reason === 'denied' ? ' (permission denied)' : '') +
-        '.<br>Use manual entry below.</div>';
+    if (!res.ok) {
+      var msg = res.reason === 'denied'
+        ? 'Camera permission was denied. Allow camera access in Settings,<br>or type the code / tap a DEMO chip below.'
+        : 'The barcode reader failed to start on this device.<br>Type the code or tap a DEMO chip below.';
+      box.innerHTML = '<div class="camnote">' + msg + '</div>';
     }
   });
 }
