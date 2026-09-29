@@ -92,6 +92,11 @@ p.hint { color: var(--muted); }
 .btn-primary { background: var(--accent); border-color: var(--accent-dark); color: #1c1005; box-shadow: 0 4px 0 var(--accent-dark); }
 .btn-huge { min-height: 88px; font-size: 1.5rem; }
 .btn-home { min-height: 76px; font-size: 1.35rem; text-align: left; padding-left: 22px; }
+.btn-free { min-height: 84px; font-size: 1.35rem; text-align: left; padding-left: 22px;
+  background: #10233d; border-color: var(--blue); color: #dbeafe;
+  box-shadow: 0 4px 0 #0a1a30; line-height: 1.25; }
+.btn-sub { display: block; font-size: 0.95rem; font-weight: 700; letter-spacing: 0.12em;
+  color: var(--blue); opacity: 0.95; }
 .btn-green { background: var(--green); border-color: var(--green-dark); color: #052e12; }
 .btn-red { background: var(--red); border-color: var(--red-dark); color: #fff; }
 .btn-yellow { background: var(--yellow); border-color: var(--yellow-dark); color: #422006; }

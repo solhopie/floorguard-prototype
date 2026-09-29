@@ -27,7 +27,7 @@ var DB = {
     var at = function (msAgo) { return new Date(now - msAgo).toISOString(); };
 
     return {
-      v: 2,
+      v: 3,
       employees: ['Marcus', 'Dana', 'Luis'],
       currentEmployee: 'Marcus',
       rolls: [
@@ -83,7 +83,17 @@ var DB = {
           widthIn: 162, expectedLocation: '204B', scannedLocation: '204A',
           expectedIn: 1200, physicalIn: 1190, diffIn: -10,
           employee: 'Marcus', at: at(0.75 * H), status: 'NEEDS_REVIEW', flagged: true, measured: true }
-      ]
+      ],
+      /* Free Run / Discovery Mode collections (v3+). Kept separate from the
+         verified-mode cycle-count data on purpose: discovery data is raw
+         physical observation, never a system comparison. */
+      freeSessions: [], /* { id, startedAt, startedBy, endedAt } */
+      freeCounts: [],   /* { id, sessionId, rollId, barcode, raw, discovered,
+                           location, measuredFt, measuredInch, physicalIn,
+                           expectedIn (null when unknown), status: 'COLLECTED',
+                           measured: true, employee, at, date, time } */
+      discovered: []    /* { id, raw, firstSeenAt, firstSeenBy, lastLocation,
+                           lastMeasuredIn, lastMeasuredAt, lastMeasuredBy, count } */
     };
   },
 
@@ -100,7 +110,18 @@ var DB = {
           this.save();
           return this.data;
         }
-        if (d && d.v === 2) { this.data = d; return d; }
+        if (d && d.v === 2) {
+          /* v2 -> v3: add the empty Free Run / Discovery collections.
+             Verified-mode data (rolls, cuts, counts) is untouched. */
+          d.v = 3;
+          if (!d.freeSessions) d.freeSessions = [];
+          if (!d.freeCounts) d.freeCounts = [];
+          if (!d.discovered) d.discovered = [];
+          this.data = d;
+          this.save();
+          return d;
+        }
+        if (d && d.v === 3) { this.data = d; return d; }
       }
     } catch (e) { /* storage unavailable -> seed in memory */ }
     this.data = this.seed();
@@ -313,7 +334,8 @@ var STATUS = {
   SHORT:            { label: 'SHORT',            chip: 'st-red'    },
   OVER:             { label: 'OVER',             chip: 'st-yellow' },
   LOCATION_MISMATCH:{ label: 'LOCATION MISMATCH',chip: 'st-red'    },
-  NEEDS_REVIEW:     { label: 'NEEDS REVIEW',     chip: 'st-yellow' }
+  NEEDS_REVIEW:     { label: 'NEEDS REVIEW',     chip: 'st-yellow' },
+  COLLECTED:        { label: 'COLLECTED',        chip: 'st-blue'   }
 };
 function statusChip(status) {
   var m = STATUS[status] || STATUS.NEEDS_REVIEW;
@@ -532,6 +554,8 @@ var TITLES = {
   'cut-scan': 'Cut — Scan Roll', 'cut-entry': 'Cut — Enter Cut', 'cut-saved': 'Cut Saved',
   'rapid-loc': 'Rapid — Scan Location', 'rapid-scan': 'Rapid Cycle Count',
   'rapid-balance': 'Rapid — Enter Balance', 'rapid-mismatch': 'Location Mismatch',
+  'free-loc': 'Free Run — Scan Location', 'free-scan': 'Free Run — Discovery Mode',
+  'free-balance': 'Free Run — Enter Balance', 'free-summary': 'Free Run — Session Summary',
   discrepancies: 'Cycle Count Discrepancies'
 };
 
@@ -572,6 +596,7 @@ Screens.home = function () {
     '<button class="btn btn-primary btn-home" id="b-start">&#9654; START CYCLE COUNT</button>' +
     '<button class="btn btn-home" id="b-rapid">&#9889; RAPID CYCLE COUNT</button>' +
     '<button class="btn btn-home" id="b-cut">&#9986; CUT / UPDATE ROLL</button>' +
+    '<button class="btn btn-free" id="b-free">&#128752; FREE RUN CYCLE COUNT<br><span class="btn-sub">DISCOVERY MODE</span></button>' +
     '<button class="btn btn-home" id="b-search">&#128269; SEARCH ROLL</button>' +
     '<button class="btn btn-home" id="b-recent">&#9776; RECENT COUNTS</button>' +
     '<button class="btn btn-home" id="b-dash">&#128202; SUPERVISOR DASHBOARD</button>' +
@@ -582,6 +607,7 @@ Screens.home = function () {
     $('#b-start').onclick = function () { newSession(); go('scan-roll'); };
     $('#b-rapid').onclick = function () { newRapid(); go('rapid-loc'); };
     $('#b-cut').onclick = function () { newCutSession(); go('cut-scan'); };
+    $('#b-free').onclick = function () { newFreeRun(); go('free-loc'); };
     $('#b-search').onclick = function () { go('search'); };
     $('#b-recent').onclick = function () { go('recent'); };
     $('#b-dash').onclick = function () { go('dashboard'); };
@@ -1170,6 +1196,11 @@ function ledgerHtml(roll) {
   DB.data.counts.forEach(function (c) {
     if (c.rollId === roll.id) ev.push({ kind: 'count', at: c.at, rec: c });
   });
+  /* Free-run discovery counts for known rolls belong in the roll's history too:
+     they are real physical measurements, tagged as free-run. */
+  (DB.data.freeCounts || []).forEach(function (c) {
+    if (c.rollId === roll.id) ev.push({ kind: 'freecount', at: c.at, rec: c });
+  });
   ev.sort(function (a, b) { return new Date(a.at) - new Date(b.at); });
   var out = '<div class="ledger-row"><span class="dot" style="background:var(--muted)"></span>' +
     '<div class="what"><b>Beginning Balance</b></div>' +
@@ -1187,7 +1218,7 @@ function ledgerHtml(roll) {
         '<div class="what"><b>Cut</b> <span class="num">' + fmtLen(e.inches) + '</span>' + orderTag +
         '<div class="sub">' + fmtDT(e.at) + ' &middot; ' + esc(e.by) + '</div></div>' +
         '<div class="bal"><div class="sub">New Balance</div><span class="num">' + fmtLen(newBal) + '</span></div></div>';
-    } else {
+    } else if (e.kind === 'count') {
       var r = e.rec;
       var phys = (r.physicalIn == null) ? '—' : fmtLen(r.physicalIn);
       var ddiff = (r.diffIn == null) ? '—' : fmtDiff(r.diffIn);
@@ -1198,6 +1229,16 @@ function ledgerHtml(roll) {
         '<div class="what"><b>Physical Cycle Count</b> <span class="num">' + phys + '</span> ' + statusChip(r.status) + mb +
         '<div class="sub">' + fmtDT(r.at) + ' &middot; ' + esc(r.employee) + ' &middot; loc <span class="mono">' + esc(r.scannedLocation) + '</span></div></div>' +
         '<div class="bal"><div class="sub">Difference</div><span class="' + dcls + ' num">' + ddiff + '</span></div></div>';
+    } else {
+      /* Free-run discovery count: a real physical measurement collected without
+         a system comparison. Shown with its COLLECTED status and MB marker. */
+      var fc = e.rec;
+      var fdiff = (fc.expectedIn == null) ? '—' : fmtDiff(fc.physicalIn - fc.expectedIn);
+      out += '<div class="ledger-row"><span class="dot" style="background:var(--blue)"></span>' +
+        '<div class="what"><b>Free-Run Count</b> <span class="num">' + fmtLen(fc.physicalIn) + '</span> ' +
+        statusChip('COLLECTED') + ' <span class="stchip st-green">MB ✓</span>' +
+        '<div class="sub">' + fmtDT(fc.at) + ' &middot; ' + esc(fc.employee) + ' &middot; loc <span class="mono">' + esc(fc.location) + '</span></div></div>' +
+        '<div class="bal"><div class="sub">vs Expected</div><span class="num">' + fdiff + '</span></div></div>';
     }
   });
   return out;
@@ -1341,6 +1382,338 @@ Screens.testbaledit = function (param) {
     var clr = $('#tbclear');
     if (clr) clr.onclick = function () { roll.testBalanceIn = null; DB.save(); good(); go('testbal'); };
     $('#tbcancel').onclick = function () { go('testbal'); };
+  }};
+};
+
+/* ---------------- FREE RUN / DISCOVERY MODE --------------------------------------
+   Walk the warehouse and collect REAL data. No preloaded-roll or preloaded-
+   location requirement: ANY location barcode is accepted as the active count
+   location, and ANY roll barcode is accepted -- rolls FloorGuard has never
+   seen become "discovered" records automatically. There is deliberately NO
+   expected-balance check and NO location-mismatch blocking here; the physical
+   scan IS the data. Verified-mode logic (START CYCLE COUNT, RAPID CYCLE COUNT,
+   discrepancies) is completely untouched. */
+
+var F = null;
+function newFreeRun() {
+  F = { id: 'FR' + Date.now().toString(36).toUpperCase(),
+        startedAt: new Date().toISOString(),
+        startedBy: DB.data.currentEmployee,
+        activeLoc: null, scan: null, lastMsg: null };
+}
+/* Same normalization as rollByBarcode (manufacturer tags often prefix the roll
+   number with "01"), so a scanned tag resolves identically for discovered
+   rolls as it does for known ones. */
+function normalizeBarcode(code) {
+  var c = String(code || '').trim().toUpperCase();
+  var s = c.replace(/^01/, '');
+  return s || c;
+}
+function findDiscovered(id) {
+  var ds = DB.data.discovered || [];
+  for (var i = 0; i < ds.length; i++) if (ds[i].id === id) return ds[i];
+  return null;
+}
+function freeCountsFor(sessionId) {
+  return (DB.data.freeCounts || []).filter(function (c) { return c.sessionId === sessionId; });
+}
+function findFreeSession(id) {
+  var ss = DB.data.freeSessions || [];
+  for (var i = 0; i < ss.length; i++) if (ss[i].id === id) return ss[i];
+  return null;
+}
+
+/* --- STEP 1: scan ANY location. No DB requirement. --- */
+Screens['free-loc'] = function () {
+  if (!F) newFreeRun();
+  var html =
+    '<div class="screen">' +
+    '<div class="step-head">FREE RUN &mdash; DISCOVERY MODE &mdash; STEP 1</div>' +
+    '<h1>Scan location</h1>' +
+    '<p class="hint">Scan <b>any</b> warehouse location barcode &mdash; it does <b>not</b> need to be preloaded. FloorGuard uses it as the active count location for every roll you scan next.</p>' +
+    '<div class="cambox" id="cambox"><div class="camnote">Starting camera&hellip;</div></div>' +
+    '<form id="manualform"><div class="field">' +
+      '<label class="label" for="manual">OR TYPE / WEDGE THE LOCATION CODE</label>' +
+      '<input class="input mono" id="manual" autocomplete="off" autocapitalize="characters" placeholder="e.g. 210C">' +
+    '</div>' +
+    '<button class="btn btn-primary btn-huge" type="submit">USE LOCATION</button></form>' +
+    '<div id="result"></div>' +
+    '<button class="btn btn-ghost" id="flcancel">CANCEL</button>' +
+    '</div>';
+  return { html: html, mount: function () {
+    mountScannerBox('cambox', onCode);
+    $('#manualform').onsubmit = function (e) { e.preventDefault(); onCode($('#manual').value); };
+    $('#flcancel').onclick = function () { F = null; go('home'); };
+  }};
+  function onCode(code) {
+    var loc = normLoc(code);
+    if (!loc) {
+      bad();
+      $('#result').innerHTML = '<div class="err center" style="font-size:1.3rem">&#10060; EMPTY SCAN &mdash; try again.</div>';
+      return;
+    }
+    good();
+    F.activeLoc = loc;
+    F.lastMsg = null;
+    go('free-scan');
+  }
+};
+
+/* --- STEP 2: scan ANY roll at the active location --- */
+function freeBanner() {
+  var m = F && F.lastMsg;
+  if (!m) return '';
+  return '<div class="card" style="border:2px solid var(--blue);text-align:center">' +
+    '<div style="font-size:1.4rem;font-weight:900;color:var(--blue)">' + esc(m) + '</div></div>';
+}
+
+Screens['free-scan'] = function () {
+  if (!F || !F.activeLoc) { setTimeout(function () { go('free-loc'); }, 0); return { html: '' }; }
+  var chips = DB.data.rolls.map(function (r) {
+    return '<button class="demochip" data-code="' + esc(r.barcode) + '">' + esc(r.barcode) + '</button>';
+  }).join('');
+  var html =
+    '<div class="screen">' +
+    '<div class="step-head">FREE RUN &mdash; DISCOVERY MODE</div>' +
+    '<div class="card" style="text-align:center">' +
+      '<div class="label">ACTIVE LOCATION</div>' +
+      '<div class="mono" style="font-size:2.4rem;font-weight:900">' + esc(F.activeLoc) + '</div>' +
+    '</div>' +
+    freeBanner() +
+    '<h1>Scan roll</h1>' +
+    '<p class="hint">Scan <b>any</b> roll &mdash; known or never-before-seen. New barcodes are discovered automatically.</p>' +
+    '<div class="cambox" id="cambox"><div class="camnote">Starting camera&hellip;</div></div>' +
+    '<form id="manualform"><div class="field">' +
+      '<label class="label" for="manual">OR TYPE / WEDGE THE BARCODE</label>' +
+      '<input class="input mono" id="manual" autocomplete="off" autocapitalize="characters" placeholder="e.g. 01QH5CPHN">' +
+    '</div>' +
+    '<button class="btn btn-primary btn-huge" type="submit">ENTER CODE</button></form>' +
+    '<div class="demolabel">DEMO &mdash; TAP TO SIMULATE A SCAN</div>' +
+    '<div class="demochips">' + chips + '</div>' +
+    '<div id="result"></div>' +
+    '<div class="btn-row">' +
+      '<button class="btn" id="fchangeloc" style="flex:1">&#8646; CHANGE LOCATION</button>' +
+      '<button class="btn btn-primary" id="fend" style="flex:1">END COUNT SESSION</button>' +
+    '</div>' +
+    '</div>';
+  return { html: html, mount: function () {
+    mountScannerBox('cambox', onCode);
+    $('#manualform').onsubmit = function (e) { e.preventDefault(); onCode($('#manual').value); };
+    Array.prototype.forEach.call(document.querySelectorAll('.demochip'), function (c) {
+      c.onclick = function () { onCode(c.getAttribute('data-code')); };
+    });
+    $('#fchangeloc').onclick = function () { go('free-loc'); };
+    $('#fend').onclick = endFreeSession;
+  }};
+  function onCode(code) {
+    var raw = String(code || '').trim();
+    if (!raw) {
+      bad();
+      $('#result').innerHTML = '<div class="err center" style="font-size:1.3rem">&#10060; EMPTY SCAN &mdash; try again.</div>';
+      return;
+    }
+    var id = normalizeBarcode(code);
+    var roll = rollByBarcode(code);
+    var expectedIn = null;
+    if (roll) {
+      /* Known roll: FloorGuard MAY show the expected balance, but it is never
+         required and never blocks the count. */
+      expectedIn = systemBalance(roll.id);
+    } else {
+      /* Never seen before: create the discovered-roll record right now so the
+         physical scan is never an error. */
+      var d = findDiscovered(id);
+      if (!d) {
+        d = { id: id, raw: raw.toUpperCase(),
+              firstSeenAt: new Date().toISOString(), firstSeenBy: DB.data.currentEmployee,
+              lastLocation: F.activeLoc,
+              lastMeasuredIn: null, lastMeasuredAt: null, lastMeasuredBy: null, count: 0 };
+        DB.data.discovered.push(d);
+        DB.save();
+      }
+    }
+    good();
+    F.scan = { rollId: id, raw: raw.toUpperCase(), known: !!roll, expectedIn: expectedIn };
+    go('free-balance');
+  }
+};
+
+/* --- STEP 3: enter the physical balance, save, loop --- */
+Screens['free-balance'] = function () {
+  if (!F || !F.activeLoc || !F.scan) { setTimeout(function () { go('free-scan'); }, 0); return { html: '' }; }
+  var s = F.scan;
+  var roll = s.known ? rollByBarcode(s.rollId) : null;
+  var rows;
+  if (roll) {
+    rows =
+      '<div class="kv"><span class="k">Style</span><span class="v">' + esc(roll.style) + '</span></div>' +
+      '<div class="kv"><span class="k">Color</span><span class="v">' + esc(roll.color) + '</span></div>' +
+      '<div class="kv"><span class="k">Width</span><span class="v">' + fmtWidth(roll.widthIn) + '</span></div>' +
+      '<div class="kv"><span class="k">Manufacturer</span><span class="v">' + esc(roll.manufacturer) + '</span></div>';
+  } else {
+    rows =
+      '<div class="kv"><span class="k">Style</span><span class="v" style="color:var(--muted)">NOT YET IMPORTED</span></div>' +
+      '<div class="kv"><span class="k">Color</span><span class="v" style="color:var(--muted)">NOT YET IMPORTED</span></div>' +
+      '<div class="kv"><span class="k">Width</span><span class="v" style="color:var(--muted)">NOT YET IMPORTED</span></div>' +
+      '<div class="kv"><span class="k">Manufacturer</span><span class="v" style="color:var(--muted)">NOT YET IMPORTED</span></div>';
+  }
+  var expRow = s.expectedIn != null
+    ? '<span class="v num" style="font-size:2rem">' + fmtLen(s.expectedIn) + '</span>'
+    : '<span class="v" style="color:var(--muted)">Not available</span>';
+  var html =
+    '<div class="screen">' +
+    '<div class="step-head">FREE RUN &mdash; DISCOVERY MODE &mdash; ' + esc(F.activeLoc) + '</div>' +
+    '<div class="card" style="text-align:center">' +
+      '<div class="label">ROLL SCANNED</div>' +
+      '<div class="mono" style="font-size:2.2rem;font-weight:900">' + esc(s.rollId) + '</div>' +
+      (s.raw !== s.rollId ? '<div class="sub mono">tag read: ' + esc(s.raw) + '</div>' : '') +
+      (s.known ? '' : '<div><span class="stchip st-blue">NEW / DISCOVERED</span></div>') +
+    '</div>' +
+    '<div class="card">' +
+      rows +
+      '<div class="kv"><span class="k">Location</span><span class="v mono">' + esc(F.activeLoc) + '</span></div>' +
+      '<div class="kv"><span class="k">EXPECTED BALANCE</span>' + expRow + '</div>' +
+    '</div>' +
+    '<div class="label">MEASURED BALANCE</div>' +
+    '<div class="btn-row">' +
+      '<div class="field" style="flex:1"><label class="label">FEET</label>' +
+      '<input class="input num" id="fft" inputmode="numeric" autocomplete="off" placeholder="0" style="font-size:2.2rem;min-height:84px;text-align:center"></div>' +
+      '<div class="field" style="flex:1"><label class="label">INCHES</label>' +
+      '<input class="input num" id="fin" inputmode="decimal" autocomplete="off" placeholder="0" style="font-size:2.2rem;min-height:84px;text-align:center"></div>' +
+    '</div>' +
+    '<div class="card" style="text-align:center"><div class="label">MEASURED BALANCE</div>' +
+      '<div class="num" id="fmeas" style="font-size:2.4rem;font-weight:900">0\' 0"</div></div>' +
+    '<div class="err" id="ferr" hidden></div>' +
+    '<button class="btn btn-primary btn-huge" id="fsavenext">&#10003; SAVE &amp; NEXT</button>' +
+    '<button class="btn" id="fback">&larr; BACK TO SCANNER</button>' +
+    '</div>';
+  return { html: html, mount: function () {
+    var upd = function () {
+      var ft = parseFloat($('#fft').value) || 0, inch = parseFloat($('#fin').value) || 0;
+      $('#fmeas').textContent = fmtLen(Math.round(ft * 12 + inch));
+    };
+    $('#fft').oninput = upd; $('#fin').oninput = upd;
+    $('#fback').onclick = function () { F.scan = null; go('free-scan'); };
+    $('#fsavenext').onclick = function () {
+      var ft = parseFloat($('#fft').value), inch = parseFloat($('#fin').value);
+      var err = '';
+      if ($('#fft').value.trim() === '' && $('#fin').value.trim() === '') err = 'Enter feet and/or inches.';
+      else if (isNaN(ft) || isNaN(inch) || ft < 0 || inch < 0) err = 'Numbers must be zero or more.';
+      if (err) { bad(); var e = $('#ferr'); e.textContent = err; e.hidden = false; return; }
+      saveFreeCount(ft, inch);
+    };
+  }};
+};
+
+function saveFreeCount(ft, inch) {
+  var s = F.scan;
+  var physicalIn = Math.round(ft * 12 + inch);
+  var now = new Date();
+  var rec = {
+    id: 'FC' + now.getTime().toString(36).toUpperCase(),
+    sessionId: F.id,
+    rollId: s.rollId, barcode: s.rollId, raw: s.raw,
+    discovered: !s.known,
+    location: F.activeLoc,
+    measuredFt: ft, measuredInch: inch, physicalIn: physicalIn,
+    expectedIn: s.expectedIn, /* null for discovered rolls: no system balance */
+    status: 'COLLECTED',      /* discovery collects; it never judges */
+    measured: true,          /* MB: the worker physically measured this roll */
+    employee: DB.data.currentEmployee,
+    at: now.toISOString(),
+    date: now.toLocaleDateString(), time: fmtTime(now.toISOString())
+  };
+  DB.data.freeCounts.push(rec);
+  if (s.known) {
+    /* A real physical measurement: stamp the roll's measured fields so the
+       supervisor can see the last physical reading in roll history. */
+    var roll = rollByBarcode(s.rollId);
+    if (roll) { roll.measuredIn = physicalIn; roll.measuredAt = rec.at; roll.measuredBy = rec.employee; }
+  } else {
+    var d = findDiscovered(s.rollId);
+    if (d) {
+      d.lastLocation = F.activeLoc;
+      d.lastMeasuredIn = physicalIn;
+      d.lastMeasuredAt = rec.at;
+      d.lastMeasuredBy = rec.employee;
+      d.count++;
+    }
+  }
+  DB.save();
+  good();
+  F.lastMsg = '✓ COLLECTED — ' + s.rollId + ' ' + fmtLen(physicalIn);
+  F.scan = null;
+  go('free-scan'); /* straight back to the scanner — never home */
+}
+
+function endFreeSession() {
+  if (!F) { go('home'); return; }
+  var now = new Date();
+  DB.data.freeSessions.push({
+    id: F.id, startedAt: F.startedAt, startedBy: F.startedBy, endedAt: now.toISOString()
+  });
+  DB.save();
+  F.endedAt = now.toISOString();
+  go('free-summary');
+}
+
+/* --- SESSION SUMMARY: supervisor review of the whole collected count --- */
+Screens['free-summary'] = function () {
+  if (!F || !F.id) { setTimeout(function () { go('home'); }, 0); return { html: '' }; }
+  var sess = findFreeSession(F.id);
+  var counts = freeCountsFor(F.id).slice().sort(function (a, b) { return new Date(b.at) - new Date(a.at); });
+  var locs = [], rolls = [], disc = [];
+  counts.forEach(function (c) {
+    if (locs.indexOf(c.location) < 0) locs.push(c.location);
+    if (rolls.indexOf(c.rollId) < 0) rolls.push(c.rollId);
+    if (c.discovered && disc.indexOf(c.rollId) < 0) disc.push(c.rollId);
+  });
+  var rows = counts.map(function (c) {
+    return '<div class="trow">' +
+      '<div class="mono"><b>' + esc(c.location) + '</b></div>' +
+      '<div class="mono">' + esc(c.rollId) + (c.discovered ? ' <span class="stchip st-blue">NEW</span>' : '') + '</div>' +
+      '<div class="num">' + fmtLen(c.physicalIn) + '</div>' +
+      '<div class="center">✓</div>' +
+      '<div class="sub">' + esc(c.time) + '</div></div>';
+  }).join('');
+  var discRows = disc.map(function (id) {
+    var d = findDiscovered(id);
+    if (!d) return '';
+    return '<div class="card">' +
+      '<div class="kv"><span class="k">Roll Barcode</span><span class="v mono">' + esc(d.id) + '</span></div>' +
+      '<div class="kv"><span class="k">Physical Location</span><span class="v mono">' + esc(d.lastLocation || '—') + '</span></div>' +
+      '<div class="kv"><span class="k">Measured Balance</span><span class="v num">' +
+        (d.lastMeasuredIn != null ? fmtLen(d.lastMeasuredIn) : '—') + '</span></div>' +
+      '<div class="kv"><span class="k">Employee</span><span class="v">' + esc(d.lastMeasuredBy || d.firstSeenBy || '—') + '</span></div>' +
+      '<div class="kv"><span class="k">Date</span><span class="v">' + esc(d.lastMeasuredAt ? fmtDate(d.lastMeasuredAt) : fmtDate(d.firstSeenAt)) + '</span></div>' +
+      '<div class="kv"><span class="k">Time</span><span class="v">' + esc(d.lastMeasuredAt ? fmtTime(d.lastMeasuredAt) : fmtTime(d.firstSeenAt)) + '</span></div>' +
+      '</div>';
+  }).join('');
+  var locChips = locs.map(function (l) { return '<span class="stchip st-blue" style="font-size:1.1rem">' + esc(l) + '</span>'; }).join(' ');
+  var html =
+    '<div class="screen">' +
+    '<div class="step-head">FREE RUN &mdash; DISCOVERY MODE</div>' +
+    '<h1>&#10003; CYCLE COUNT COMPLETE</h1>' +
+    '<div class="card">' +
+      '<div class="kv"><span class="k">Locations Scanned</span><span class="v num">' + locs.length + '</span></div>' +
+      '<div class="kv"><span class="k">Rolls Counted</span><span class="v num">' + counts.length + '</span></div>' +
+      '<div class="kv"><span class="k">Measured Rolls</span><span class="v num">' + rolls.length + '</span></div>' +
+      '<div class="kv"><span class="k">Unknown/New Rolls Discovered</span><span class="v num">' + disc.length + '</span></div>' +
+      '<div class="kv"><span class="k">Started</span><span class="v">' + fmtDT(F.startedAt) + '</span></div>' +
+      '<div class="kv"><span class="k">Completed</span><span class="v">' + fmtDT(F.endedAt || (sess && sess.endedAt) || new Date().toISOString()) + '</span></div>' +
+      '<div class="kv"><span class="k">Employee</span><span class="v">' + esc(F.startedBy) + '</span></div>' +
+    '</div>' +
+    '<div class="h2">Collected Counts</div>' +
+    '<div class="thead trow"><div>LOCATION</div><div>ROLL</div><div>MEASURED</div><div>MB</div><div>TIME</div></div>' +
+    (rows || '<div class="hint center">No rolls counted in this session.</div>') +
+    '<div class="h2">Discovered Rolls</div>' +
+    (discRows || '<div class="hint center">No new rolls discovered.</div>') +
+    '<div class="h2">Discovered Locations</div>' +
+    '<div class="card">' + (locChips || '<span class="hint">None.</span>') + '</div>' +
+    '<button class="btn btn-primary btn-huge" id="fdone">DONE &mdash; BACK TO HOME</button>' +
+    '</div>';
+  return { html: html, mount: function () {
+    $('#fdone').onclick = function () { F = null; go('home'); };
   }};
 };
 
