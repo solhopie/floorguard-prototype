@@ -1257,7 +1257,7 @@ Screens.count = function (param) {
       '<div class="kv"><span class="k">Expected Location</span><span class="v mono">' + esc(c.expectedLocation) + '</span></div>' +
       '<div class="kv"><span class="k">Scanned Location</span><span class="v mono">' + esc(c.scannedLocation) + '</span></div>' +
       '<div class="kv"><span class="k">Expected Balance</span><span class="v num">' + fmtLen(c.expectedIn) + '</span></div>' +
-      '<div class="kv"><span class="k">Physical Balance' + (c.measured ? ' <span class="stchip st-green">MB ✓</span>' : '') + '</span><span class="v num">' +
+      '<div class="kv"><span class="k">Physical Balance' + (isMeasuredCount(c) ? ' <span class="stchip st-green">MB ✓</span>' : '') + '</span><span class="v num">' +
         (c.physicalIn == null ? '— (not measured)' : fmtLen(c.physicalIn)) + '</span></div>' +
       '<div class="kv"><span class="k">Difference</span><span class="v ' + (c.diffIn == null ? '' : diffCls(c.diffIn)) + ' num">' +
         (c.diffIn == null ? '—' : fmtDiff(c.diffIn)) + '</span></div>' +
