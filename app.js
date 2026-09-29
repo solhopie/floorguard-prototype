@@ -1685,7 +1685,7 @@ Screens['free-summary'] = function () {
       '<div class="kv"><span class="k">Measured Balance</span><span class="v num">' +
         (d.lastMeasuredIn != null ? fmtLen(d.lastMeasuredIn) : '—') + '</span></div>' +
       '<div class="kv"><span class="k">Employee</span><span class="v">' + esc(d.lastMeasuredBy || d.firstSeenBy || '—') + '</span></div>' +
-      '<div class="kv"><span class="k">Date</span><span class="v">' + esc(d.lastMeasuredAt ? fmtDate(d.lastMeasuredAt) : fmtDate(d.firstSeenAt)) + '</span></div>' +
+      '<div class="kv"><span class="k">Date</span><span class="v">' + esc(new Date(d.lastMeasuredAt || d.firstSeenAt).toLocaleDateString()) + '</span></div>' +
       '<div class="kv"><span class="k">Time</span><span class="v">' + esc(d.lastMeasuredAt ? fmtTime(d.lastMeasuredAt) : fmtTime(d.firstSeenAt)) + '</span></div>' +
       '</div>';
   }).join('');
