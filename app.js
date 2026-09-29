@@ -27,7 +27,7 @@ var DB = {
     var at = function (msAgo) { return new Date(now - msAgo).toISOString(); };
 
     return {
-      v: 3,
+      v: 4,
       employees: ['Marcus', 'Dana', 'Luis'],
       currentEmployee: 'Marcus',
       rolls: [
@@ -92,8 +92,15 @@ var DB = {
                            location, measuredFt, measuredInch, physicalIn,
                            expectedIn (null when unknown), status: 'COLLECTED',
                            measured: true, employee, at, date, time } */
-      discovered: []    /* { id, raw, firstSeenAt, firstSeenBy, lastLocation,
+      discovered: [],   /* { id, raw, firstSeenAt, firstSeenBy, lastLocation,
                            lastMeasuredIn, lastMeasuredAt, lastMeasuredBy, count } */
+      documents: []     /* History Card Scan captures (v4+). One record per
+                           photo, never overwritten: { id, rollId, barcode, raw,
+                           discovered, kind: 'HISTORY_CARD', docType,
+                           image (downscaled JPEG data URL),
+                           thumb (small data URL), employee, at, date, time,
+                           location (or null), source: 'PAPER CARD', num,
+                           imports: [ confirmed smart-extractions ] } */
     };
   },
 
@@ -121,7 +128,16 @@ var DB = {
           this.save();
           return d;
         }
-        if (d && d.v === 3) { this.data = d; return d; }
+        if (d && d.v === 3) {
+          /* v3 -> v4: add the empty History Card / document collection.
+             Rolls, cuts, counts, and Free Run data are untouched. */
+          d.v = 4;
+          if (!d.documents) d.documents = [];
+          this.data = d;
+          this.save();
+          return d;
+        }
+        if (d && d.v === 4) { this.data = d; return d; }
       }
     } catch (e) { /* storage unavailable -> seed in memory */ }
     this.data = this.seed();
@@ -556,7 +572,9 @@ var TITLES = {
   'rapid-balance': 'Rapid — Enter Balance', 'rapid-mismatch': 'Location Mismatch',
   'free-loc': 'Free Run — Scan Location', 'free-scan': 'Free Run — Discovery Mode',
   'free-balance': 'Free Run — Enter Balance', 'free-summary': 'Free Run — Session Summary',
-  discrepancies: 'Cycle Count Discrepancies'
+  discrepancies: 'Cycle Count Discrepancies',
+  'doc-capture': 'Scan History Card', 'doc-review': 'Review History Card',
+  'doc-view': 'History Card', 'doc-extract': 'Extract History'
 };
 
 function render() {
@@ -1162,6 +1180,7 @@ Screens.roll = function (param) {
   var roll = rollById(param);
   if (!roll) { setTimeout(function () { go('search'); }, 0); return { html: '' }; }
   var sys = systemBalance(roll.id);
+  var docs = docsForRoll(roll.id);
   var html =
     '<div class="screen">' +
     '<div class="step-head">ROLL HISTORY</div>' +
@@ -1179,14 +1198,37 @@ Screens.roll = function (param) {
           '<div class="kv"><span class="k">Last Measured</span><span class="v">' + fmtDT(roll.measuredAt) + ' &middot; ' + esc(roll.measuredBy || '') + '</span></div>'
         : '<div class="kv"><span class="k">Measured Balance</span><span class="v">Not measured yet</span></div>') +
     '</div>' +
-    '<h2>History</h2>' +
+    '<button class="btn btn-primary btn-huge" id="scanhist">&#128247; SCAN HISTORY CARD</button>' +
+    '<h2>Activity History</h2>' +
     '<div class="ledger">' + ledgerHtml(roll) + '</div>' +
+    '<h2>Documents</h2>' +
+    '<div class="label" style="margin-bottom:8px">ORIGINAL HISTORY CARDS</div>' +
+    (docs.length ? docsHtml(docs) : '<div class="hint">No history cards captured yet.</div>') +
     '<button class="btn btn-primary btn-huge" id="countthis">&#9654; COUNT THIS ROLL</button>' +
     '</div>';
   return { html: html, mount: function () {
+    $('#scanhist').onclick = function () {
+      newDocCapture(roll.id, { location: roll.expectedLocation, returnTo: { name: 'roll', param: roll.id } });
+      go('doc-capture');
+    };
     $('#countthis').onclick = function () { newSession(); S.roll = roll; go('scan-loc'); };
+    wireDocViews();
   }};
 };
+
+/* One-line summary of confirmed extracted fields for the timeline. */
+function importSummary(f) {
+  var bits = [];
+  if (f.job) bits.push('Job ' + esc(f.job));
+  if (f.order) bits.push('Order ' + esc(f.order));
+  if (f.cut) bits.push('Cut ' + fmtLen(f.cut.totalIn));
+  if (f.balance) bits.push('Balance ' + fmtLen(f.balance.totalIn));
+  if (f.measured) bits.push('MB ' + fmtLen(f.measured.totalIn));
+  if (f.date) bits.push(esc(f.date));
+  if (f.size) bits.push('Size ' + esc(f.size));
+  if (f.notes) bits.push('“' + esc(f.notes) + '”');
+  return bits.length ? bits.join(' &middot; ') : 'No values entered.';
+}
 
 function ledgerHtml(roll) {
   var ev = [];
@@ -1200,6 +1242,16 @@ function ledgerHtml(roll) {
      they are real physical measurements, tagged as free-run. */
   (DB.data.freeCounts || []).forEach(function (c) {
     if (c.rollId === roll.id) ev.push({ kind: 'freecount', at: c.at, rec: c });
+  });
+  /* History card captures and their confirmed smart-extractions are timeline
+     events too. They never touch balances — they document the paper trail. */
+  (DB.data.documents || []).forEach(function (d) {
+    if (d.rollId === roll.id) {
+      ev.push({ kind: 'doc', at: d.at, doc: d });
+      (d.imports || []).forEach(function (imp) {
+        ev.push({ kind: 'import', at: imp.confirmedAt, doc: d, imp: imp });
+      });
+    }
   });
   ev.sort(function (a, b) { return new Date(a.at) - new Date(b.at); });
   var out = '<div class="ledger-row"><span class="dot" style="background:var(--muted)"></span>' +
@@ -1216,7 +1268,7 @@ function ledgerHtml(roll) {
       var orderTag = e.order ? ' <span class="mono">Order ' + esc(e.order) + '</span>' : '';
       out += '<div class="ledger-row"><span class="dot" style="background:var(--blue)"></span>' +
         '<div class="what"><b>Cut</b> <span class="num">' + fmtLen(e.inches) + '</span>' + orderTag +
-        '<div class="sub">' + fmtDT(e.at) + ' &middot; ' + esc(e.by) + '</div></div>' +
+        '<div class="sub">' + fmtDT(e.at) + ' &middot; ' + esc(e.by) + ' &middot; <span class="srcchip">FLOORGUARD</span></div></div>' +
         '<div class="bal"><div class="sub">New Balance</div><span class="num">' + fmtLen(newBal) + '</span></div></div>';
     } else if (e.kind === 'count') {
       var r = e.rec;
@@ -1227,9 +1279,9 @@ function ledgerHtml(roll) {
       out += '<div class="ledger-row"><span class="dot" style="background:' +
         (r.status === 'MATCH' ? 'var(--green)' : r.status === 'NEEDS_REVIEW' ? 'var(--yellow)' : 'var(--red)') + '"></span>' +
         '<div class="what"><b>Physical Cycle Count</b> <span class="num">' + phys + '</span> ' + statusChip(r.status) + mb +
-        '<div class="sub">' + fmtDT(r.at) + ' &middot; ' + esc(r.employee) + ' &middot; loc <span class="mono">' + esc(r.scannedLocation) + '</span></div></div>' +
+        '<div class="sub">' + fmtDT(r.at) + ' &middot; ' + esc(r.employee) + ' &middot; loc <span class="mono">' + esc(r.scannedLocation) + '</span> &middot; <span class="srcchip">FLOORGUARD</span></div></div>' +
         '<div class="bal"><div class="sub">Difference</div><span class="' + dcls + ' num">' + ddiff + '</span></div></div>';
-    } else {
+    } else if (e.kind === 'freecount') {
       /* Free-run discovery count: a real physical measurement collected without
          a system comparison. Shown with its COLLECTED status and MB marker. */
       var fc = e.rec;
@@ -1237,8 +1289,26 @@ function ledgerHtml(roll) {
       out += '<div class="ledger-row"><span class="dot" style="background:var(--blue)"></span>' +
         '<div class="what"><b>Free-Run Count</b> <span class="num">' + fmtLen(fc.physicalIn) + '</span> ' +
         statusChip('COLLECTED') + ' <span class="stchip st-green">MB ✓</span>' +
-        '<div class="sub">' + fmtDT(fc.at) + ' &middot; ' + esc(fc.employee) + ' &middot; loc <span class="mono">' + esc(fc.location) + '</span></div></div>' +
+        '<div class="sub">' + fmtDT(fc.at) + ' &middot; ' + esc(fc.employee) + ' &middot; loc <span class="mono">' + esc(fc.location) + '</span> &middot; <span class="srcchip">FLOORGUARD</span></div></div>' +
         '<div class="bal"><div class="sub">vs Expected</div><span class="num">' + fdiff + '</span></div></div>';
+    } else if (e.kind === 'doc') {
+      /* HISTORY CARD CAPTURED: the photo is the record. VIEW DOCUMENT opens
+         the full-size original; the image is never altered after capture. */
+      var dc = e.doc;
+      out += '<div class="ledger-row"><span class="dot" style="background:var(--yellow)"></span>' +
+        '<div class="what"><b>History Card Captured</b> <span class="srcchip">PAPER CARD</span>' +
+        '<div class="sub">' + fmtDT(dc.at) + ' &middot; ' + esc(dc.employee) +
+        (dc.location ? ' &middot; loc <span class="mono">' + esc(dc.location) + '</span>' : '') + '</div></div>' +
+        '<div class="bal"><button class="btn btn-xs" data-docview="' + esc(dc.id) + '">VIEW DOCUMENT</button></div></div>';
+    } else if (e.kind === 'import') {
+      /* PAPER CARD IMPORT: human-confirmed data extracted from a history card.
+         Displayed as history only — it never changes expected balances. */
+      var im = e.imp;
+      out += '<div class="ledger-row"><span class="dot" style="background:var(--yellow)"></span>' +
+        '<div class="what"><b>Paper Card Import</b> <span class="srcchip src-import">PAPER CARD IMPORT</span>' +
+        '<div class="sub">' + fmtDT(im.confirmedAt) + ' &middot; ' + esc(im.confirmedBy) + '</div>' +
+        '<div class="sub">' + importSummary(im.fields) + '</div></div>' +
+        '<div class="bal"><button class="btn btn-xs" data-docview="' + esc(im.docId || e.doc.id) + '">VIEW DOCUMENT</button></div></div>';
     }
   });
   return out;
@@ -1575,6 +1645,7 @@ Screens['free-balance'] = function () {
       '<div class="kv"><span class="k">EXPECTED BALANCE</span>' + expRow + '</div>' +
     '</div>' +
     '<div class="label">MEASURED BALANCE</div>' +
+    '<button class="btn" id="fdochist" style="margin-bottom:14px">&#128247; SCAN HISTORY CARD <span class="sub">(optional)</span></button>' +
     '<div class="btn-row">' +
       '<div class="field" style="flex:1"><label class="label">FEET</label>' +
       '<input class="input num" id="fft" inputmode="numeric" autocomplete="off" placeholder="0" style="font-size:2.2rem;min-height:84px;text-align:center"></div>' +
@@ -1594,6 +1665,12 @@ Screens['free-balance'] = function () {
     };
     $('#fft').oninput = upd; $('#fin').oninput = upd;
     $('#fback').onclick = function () { F.scan = null; go('free-scan'); };
+    $('#fdochist').onclick = function () {
+      /* Optional: capture the paper history card, then come back here to
+         enter the measured balance. Never forced, normally once per roll. */
+      newDocCapture(s.rollId, { location: F.activeLoc, returnTo: { name: 'free-balance' } });
+      go('doc-capture');
+    };
     $('#fsavenext').onclick = function () {
       var ft = parseFloat($('#fft').value), inch = parseFloat($('#fin').value);
       var err = '';
@@ -1679,6 +1756,7 @@ Screens['free-summary'] = function () {
   var discRows = disc.map(function (id) {
     var d = findDiscovered(id);
     if (!d) return '';
+    var ddocs = docsForRoll(d.id);
     return '<div class="card">' +
       '<div class="kv"><span class="k">Roll Barcode</span><span class="v mono">' + esc(d.id) + '</span></div>' +
       '<div class="kv"><span class="k">Physical Location</span><span class="v mono">' + esc(d.lastLocation || '—') + '</span></div>' +
@@ -1687,6 +1765,10 @@ Screens['free-summary'] = function () {
       '<div class="kv"><span class="k">Employee</span><span class="v">' + esc(d.lastMeasuredBy || d.firstSeenBy || '—') + '</span></div>' +
       '<div class="kv"><span class="k">Date</span><span class="v">' + esc(new Date(d.lastMeasuredAt || d.firstSeenAt).toLocaleDateString()) + '</span></div>' +
       '<div class="kv"><span class="k">Time</span><span class="v">' + esc(d.lastMeasuredAt ? fmtTime(d.lastMeasuredAt) : fmtTime(d.firstSeenAt)) + '</span></div>' +
+      (ddocs.length
+        ? '<div class="kv"><span class="k">History Cards</span><span class="v">&#128247; ' + ddocs.length +
+          ' &middot; <button class="btn btn-xs" data-docview="' + esc(ddocs[0].id) + '">VIEW</button></span></div>'
+        : '') +
       '</div>';
   }).join('');
   var locChips = locs.map(function (l) { return '<span class="stchip st-blue" style="font-size:1.1rem">' + esc(l) + '</span>'; }).join(' ');
@@ -1714,8 +1796,343 @@ Screens['free-summary'] = function () {
     '</div>';
   return { html: html, mount: function () {
     $('#fdone').onclick = function () { F = null; go('home'); };
+    wireDocViews();
   }};
 };
+
+/* ---------------- HISTORY CARD SCAN / DOCUMENT CAPTURE -------------------------
+   Preserve the handwritten paper history cards attached to carpet rolls and
+   connect each photo to the correct Roll ID inside FloorGuard.
+   WORKFLOW: scan roll -> open roll record -> SCAN HISTORY CARD -> take photo ->
+   USE PHOTO -> SAVE -> photo becomes part of the roll's permanent record.
+   - Originals are never overwritten: each capture becomes HISTORY CARD #1, #2...
+   - Capture uses a plain file-input camera picker, NOT the barcode scanners.
+     The roll/location scanner implementations are untouched.
+   - Optional smart extraction is review-first: nothing extracted is ever
+     treated as confirmed data until a human taps CONFIRM; confirmed imports
+     are labeled PAPER CARD IMPORT and never change expected balances.
+   - Data source labels: FLOORGUARD (digital activity), PAPER CARD (the photo),
+     PAPER CARD IMPORT (confirmed extracted data), REAL FLOORS (future API). */
+var D = null; /* transient capture context; images live here until saved */
+
+function newDocCapture(rollId, opts) {
+  opts = opts || {};
+  var roll = rollByBarcode(rollId);
+  D = {
+    rollId: String(rollId),
+    barcode: roll ? roll.barcode : String(rollId || '').trim().toUpperCase(),
+    discovered: !roll,
+    location: opts.location || (roll ? roll.expectedLocation : '') || '',
+    returnTo: opts.returnTo || null, /* {name, param} after a fresh save */
+    image: null, thumb: null,
+    docId: null, fresh: false, saveError: ''
+  };
+}
+function docsForRoll(rollId) {
+  return (DB.data.documents || []).filter(function (d) { return d.rollId === rollId; })
+    .sort(function (a, b) { return a.at < b.at ? -1 : 1; });
+}
+function findDoc(id) {
+  var ds = DB.data.documents || [];
+  for (var i = 0; i < ds.length; i++) if (ds[i].id === id) return ds[i];
+  return null;
+}
+/* Downscale a captured photo to a JPEG data URL so device-local storage stays
+   small. The downscaled image IS the preserved original: it is written once
+   and never re-compressed or overwritten afterwards. */
+function downscaleImage(dataUrl, maxDim, quality, cb) {
+  var img = new Image();
+  img.onload = function () {
+    try {
+      var scale = Math.min(1, maxDim / Math.max(img.width, img.height));
+      var cv = document.createElement('canvas');
+      cv.width = Math.max(1, Math.round(img.width * scale));
+      cv.height = Math.max(1, Math.round(img.height * scale));
+      cv.getContext('2d').drawImage(img, 0, 0, cv.width, cv.height);
+      cb(cv.toDataURL('image/jpeg', quality));
+    } catch (e) { cb(null); }
+  };
+  img.onerror = function () { cb(null); };
+  img.src = dataUrl;
+}
+/* Persist with real quota errors instead of DB.save()'s silent catch, so a
+   full device tells the truth instead of pretending the photo was saved. */
+function persistOrThrow() {
+  localStorage.setItem(DB.KEY, JSON.stringify(DB.data));
+}
+
+/* --- STEP 1: take the photo (file-input camera picker, not a scanner) --- */
+Screens['doc-capture'] = function () {
+  if (!D || !D.rollId) { setTimeout(function () { go('home'); }, 0); return { html: '' }; }
+  var rt = D.returnTo;
+  var html =
+    '<div class="screen">' +
+    '<div class="step-head">HISTORY CARD SCAN</div>' +
+    '<div class="card" style="text-align:center">' +
+      '<div class="label">HISTORY CARD FOR ROLL</div>' +
+      '<div class="mono" style="font-size:2rem;font-weight:900">' + esc(D.rollId) + '</div>' +
+      (D.discovered ? '<div><span class="stchip st-blue">DISCOVERED ROLL</span></div>' : '') +
+    '</div>' +
+    '<p class="hint">Photograph the handwritten paper history card attached to this roll. The photo becomes part of the roll&rsquo;s permanent record.</p>' +
+    '<input type="file" id="docfile" accept="image/*" capture="environment" hidden>' +
+    '<button class="btn btn-primary btn-huge" id="takephoto">&#128247; TAKE PHOTO</button>' +
+    '<button class="btn btn-ghost" id="dccancel">CANCEL</button>' +
+    '<div class="err" id="dcerr" hidden></div>' +
+    '</div>';
+  return { html: html, mount: function () {
+    $('#takephoto').onclick = function () { $('#docfile').click(); };
+    $('#dccancel').onclick = function () { D = null; if (rt) go(rt.name, rt.param); else history.back(); };
+    $('#docfile').onchange = function () {
+      var f = $('#docfile').files[0];
+      if (!f) return;
+      var e = $('#dcerr'); e.hidden = true;
+      var rd = new FileReader();
+      rd.onload = function () {
+        downscaleImage(rd.result, 1280, 0.72, function (img) {
+          if (!img) { bad(); e.textContent = 'Could not read that photo. Try again.'; e.hidden = false; return; }
+          downscaleImage(rd.result, 320, 0.6, function (th) {
+            D.image = img; D.thumb = th || img;
+            good(); go('doc-review');
+          });
+        });
+      };
+      rd.onerror = function () { bad(); e.textContent = 'Could not read that photo. Try again.'; e.hidden = false; };
+      rd.readAsDataURL(f);
+    };
+  }};
+};
+
+/* --- STEP 2: review the photo, then USE PHOTO / RETAKE / CANCEL --- */
+Screens['doc-review'] = function () {
+  if (!D || !D.image) { setTimeout(function () { go('home'); }, 0); return { html: '' }; }
+  var html =
+    '<div class="screen">' +
+    '<div class="step-head">HISTORY CARD SCAN</div>' +
+    '<h1>Review photo</h1>' +
+    '<div class="card" style="text-align:center"><img src="' + D.image + '" style="max-width:100%;border-radius:8px"></div>' +
+    '<div class="field"><label class="label" for="docloc">LOCATION (IF KNOWN)</label>' +
+    '<input class="input mono" id="docloc" autocomplete="off" autocapitalize="characters" value="' + esc(D.location) + '" placeholder="e.g. 205B"></div>' +
+    (D.saveError ? '<div class="err">' + esc(D.saveError) + '</div>' : '') +
+    '<button class="btn btn-primary btn-huge" id="usephoto">&#10003; USE PHOTO</button>' +
+    '<div class="btn-row">' +
+      '<button class="btn" id="retake" style="flex:1">&#8635; RETAKE</button>' +
+      '<button class="btn btn-ghost" id="dcancel2" style="flex:1">CANCEL</button>' +
+    '</div>' +
+    '</div>';
+  return { html: html, mount: function () {
+    $('#usephoto').onclick = function () {
+      D.location = normLoc($('#docloc').value) || $('#docloc').value.trim();
+      saveDocument();
+    };
+    $('#retake').onclick = function () { go('doc-capture'); };
+    $('#dcancel2').onclick = function () {
+      var rt = D.returnTo; D = null;
+      if (rt) go(rt.name, rt.param); else history.back();
+    };
+  }};
+};
+
+function saveDocument() {
+  var now = new Date();
+  var rec = {
+    id: 'D' + now.getTime().toString(36).toUpperCase(),
+    rollId: D.rollId, barcode: D.barcode, raw: D.barcode,
+    discovered: D.discovered,
+    kind: 'HISTORY_CARD', docType: 'HISTORY CARD',
+    image: D.image, thumb: D.thumb,
+    employee: DB.data.currentEmployee,
+    at: now.toISOString(), date: now.toLocaleDateString(), time: fmtTime(now.toISOString()),
+    location: D.location || null,
+    source: 'PAPER CARD',
+    num: docsForRoll(D.rollId).length + 1,
+    imports: [] /* confirmed smart-extractions, added later via doc-extract */
+  };
+  DB.data.documents.push(rec);
+  try { persistOrThrow(); }
+  catch (e) {
+    /* Quota/full storage: roll the record back and say so on the review
+       screen. The photo is NOT lost from the worker's hands — they can retry. */
+    DB.data.documents.pop();
+    bad();
+    D.saveError = 'Device storage is full — the photo could not be saved. Free up space and tap USE PHOTO again.';
+    return;
+  }
+  D.docId = rec.id; D.fresh = true;
+  D.image = null; D.thumb = null; /* free the big in-memory strings */
+  D.saveError = '';
+  good();
+  go('doc-view', rec.id);
+}
+
+/* --- Saved document: full record, VIEW ORIGINAL, optional extraction --- */
+Screens['doc-view'] = function (param) {
+  var doc = findDoc(param);
+  if (!doc) { setTimeout(function () { go('home'); }, 0); return { html: '' }; }
+  var imports = (doc.imports || []).map(function (imp) {
+    return '<div class="card"><div class="kv"><span class="k">Status</span>' +
+      '<span class="v"><span class="srcchip src-import">PAPER CARD IMPORT</span></span></div>' +
+      importFieldsHtml(imp.fields) +
+      '<div class="sub">Confirmed by ' + esc(imp.confirmedBy) + ' &middot; ' + fmtDT(imp.confirmedAt) + '</div></div>';
+  }).join('');
+  var freshContinue = D && D.fresh && D.docId === doc.id && D.returnTo;
+  var html =
+    '<div class="screen">' +
+    '<div class="step-head">ROLL DOCUMENT</div>' +
+    '<h1 class="mono">HISTORY CARD #' + doc.num + '</h1>' +
+    '<div class="card" style="text-align:center">' +
+      '<img src="' + doc.thumb + '" id="docimg" style="max-width:100%;border-radius:8px">' +
+      '<br><button class="btn" id="vieworig" style="margin-top:10px">&#128269; VIEW ORIGINAL</button>' +
+    '</div>' +
+    '<div class="card">' +
+      '<div class="kv"><span class="k">Roll</span><span class="v mono">' + esc(doc.rollId) + '</span></div>' +
+      '<div class="kv"><span class="k">Document Type</span><span class="v">' + esc(doc.docType) + '</span></div>' +
+      '<div class="kv"><span class="k">Captured</span><span class="v">' + esc(doc.date) + ' &middot; ' + esc(doc.time) + '</span></div>' +
+      '<div class="kv"><span class="k">Employee</span><span class="v">' + esc(doc.employee) + '</span></div>' +
+      '<div class="kv"><span class="k">Location</span><span class="v mono">' + esc(doc.location || '&mdash;') + '</span></div>' +
+      '<div class="kv"><span class="k">Source</span><span class="v"><span class="srcchip">PAPER CARD</span></span></div>' +
+    '</div>' +
+    imports +
+    '<button class="btn btn-huge" id="extract">&#10024; EXTRACT HISTORY FROM CARD</button>' +
+    (freshContinue
+      ? '<button class="btn btn-primary btn-huge" id="doccontinue">CONTINUE &rarr;</button>'
+      : '<button class="btn btn-ghost" id="docback">&larr; BACK</button>') +
+    '<div id="docoverlay" class="doc-overlay" hidden><img id="docfull" alt="History card original"><div class="hint" style="color:#fff">Tap to close</div></div>' +
+    '</div>';
+  return { html: html, mount: function () {
+    $('#vieworig').onclick = function () {
+      $('#docfull').src = doc.image;
+      $('#docoverlay').hidden = false;
+    };
+    $('#docoverlay').onclick = function () { $('#docoverlay').hidden = true; $('#docfull').removeAttribute('src'); };
+    $('#extract').onclick = function () { go('doc-extract', doc.id); };
+    if (freshContinue) {
+      $('#doccontinue').onclick = function () { var rt = D.returnTo; D = null; go(rt.name, rt.param); };
+    } else {
+      $('#docback').onclick = function () { history.back(); };
+    }
+  }};
+};
+
+/* --- OPTIONAL SMART EXTRACTION ------------------------------------------------
+   Prototype feature "EXTRACT HISTORY FROM CARD". extractFromImage() is the
+   single seam where a future OCR engine plugs in. This build ships with no
+   OCR engine (offline-first; no heavy deps), so auto-read reports unavailable
+   and the worker reads the card and enters values — the review screen,
+   UNVERIFIED labeling, and CONFIRM / EDIT / IGNORE workflow are identical
+   either way. Nothing extracted ever becomes confirmed data without CONFIRM,
+   and confirmed imports NEVER change expected balances. */
+function extractFromImage(dataUrl) {
+  return {
+    available: false,
+    fields: null,
+    note: 'Auto-read is not available in this prototype build — read the card above and enter the values below.'
+  };
+}
+function readExtractFields() {
+  function num(id) { var v = parseFloat(($('#' + id).value || '').trim()); return isNaN(v) ? null : v; }
+  function ftin(ftId, inId) {
+    var ft = num(ftId), inch = num(inId);
+    if (ft == null && inch == null) return null;
+    return { ft: ft || 0, inch: inch || 0, totalIn: Math.round((ft || 0) * 12 + (inch || 0)) };
+  }
+  return {
+    job: $('#xjob').value.trim(), order: $('#xorder').value.trim(),
+    cut: ftin('xcutft', 'xcutin'), balance: ftin('xbalft', 'xbalin'),
+    measured: ftin('xmbft', 'xmbin'),
+    date: $('#xdate').value.trim(), size: $('#xsize').value.trim(),
+    notes: $('#xnotes').value.trim()
+  };
+}
+function importFieldsHtml(f) {
+  var rows = [];
+  if (f.job) rows.push(['Job Number', esc(f.job)]);
+  if (f.order) rows.push(['Order Number', esc(f.order)]);
+  if (f.cut) rows.push(['Cut', '<span class="num">' + fmtLen(f.cut.totalIn) + '</span>']);
+  if (f.balance) rows.push(['Balance', '<span class="num">' + fmtLen(f.balance.totalIn) + '</span>']);
+  if (f.measured) rows.push(['Measured Balance', '<span class="num">' + fmtLen(f.measured.totalIn) + '</span> <span class="stchip st-green">MB &#10003;</span>']);
+  if (f.date) rows.push(['Date', esc(f.date)]);
+  if (f.size) rows.push(['Size', esc(f.size)]);
+  if (f.notes) rows.push(['Notes', esc(f.notes)]);
+  if (!rows.length) return '<div class="sub">No values entered.</div>';
+  return rows.map(function (r) {
+    return '<div class="kv"><span class="k">' + r[0] + '</span><span class="v">' + r[1] + '</span></div>';
+  }).join('');
+}
+Screens['doc-extract'] = function (param) {
+  var doc = findDoc(param);
+  if (!doc) { setTimeout(function () { go('home'); }, 0); return { html: '' }; }
+  var ext = extractFromImage(doc.image);
+  var pre = function (v) { return esc(v || ''); };
+  var pf = ext.fields || {};
+  var html =
+    '<div class="screen">' +
+    '<div class="step-head">HISTORY CARD SCAN</div>' +
+    '<h1>Extract history</h1>' +
+    '<div class="card" style="border:2px solid var(--yellow)">' +
+      '<div style="font-weight:900;color:var(--yellow)">&#9888; UNVERIFIED IMPORTED HISTORY</div>' +
+      '<div class="hint">Handwriting reads may be imperfect. Nothing here is confirmed data — review every field before confirming.</div>' +
+      (ext.available ? '' : '<div class="hint">' + esc(ext.note) + '</div>') +
+    '</div>' +
+    '<div class="card" style="text-align:center"><img src="' + doc.thumb + '" style="max-width:100%;border-radius:8px"></div>' +
+    '<div class="field"><label class="label" for="xjob">JOB NUMBER</label><input class="input mono" id="xjob" autocomplete="off" value="' + pre(pf.job) + '"></div>' +
+    '<div class="field"><label class="label" for="xorder">ORDER NUMBER</label><input class="input mono" id="xorder" autocomplete="off" value="' + pre(pf.order) + '"></div>' +
+    '<div class="label">CUT AMOUNT</div><div class="btn-row">' +
+      '<div class="field" style="flex:1"><label class="label" for="xcutft">FEET</label><input class="input num" id="xcutft" inputmode="numeric" autocomplete="off" value="' + pre(pf.cutFt) + '"></div>' +
+      '<div class="field" style="flex:1"><label class="label" for="xcutin">INCHES</label><input class="input num" id="xcutin" inputmode="decimal" autocomplete="off" value="' + pre(pf.cutIn) + '"></div></div>' +
+    '<div class="label">BALANCE</div><div class="btn-row">' +
+      '<div class="field" style="flex:1"><label class="label" for="xbalft">FEET</label><input class="input num" id="xbalft" inputmode="numeric" autocomplete="off" value="' + pre(pf.balFt) + '"></div>' +
+      '<div class="field" style="flex:1"><label class="label" for="xbalin">INCHES</label><input class="input num" id="xbalin" inputmode="decimal" autocomplete="off" value="' + pre(pf.balIn) + '"></div></div>' +
+    '<div class="label">MEASURED BALANCE (MB)</div><div class="btn-row">' +
+      '<div class="field" style="flex:1"><label class="label" for="xmbft">FEET</label><input class="input num" id="xmbft" inputmode="numeric" autocomplete="off" value="' + pre(pf.mbFt) + '"></div>' +
+      '<div class="field" style="flex:1"><label class="label" for="xmbin">INCHES</label><input class="input num" id="xmbin" inputmode="decimal" autocomplete="off" value="' + pre(pf.mbIn) + '"></div></div>' +
+    '<div class="field"><label class="label" for="xdate">DATE (ON CARD)</label><input class="input" id="xdate" autocomplete="off" value="' + pre(pf.date) + '"></div>' +
+    '<div class="field"><label class="label" for="xsize">SIZE</label><input class="input" id="xsize" autocomplete="off" value="' + pre(pf.size) + '"></div>' +
+    '<div class="field"><label class="label" for="xnotes">NOTES</label><textarea class="input" id="xnotes" rows="3">' + pre(pf.notes) + '</textarea></div>' +
+    '<button class="btn btn-primary btn-huge" id="xconfirm">&#10003; CONFIRM IMPORT</button>' +
+    '<div class="btn-row">' +
+      '<button class="btn" id="xedit" style="flex:1">&#9998; EDIT</button>' +
+      '<button class="btn btn-ghost" id="xignore" style="flex:1">IGNORE</button>' +
+    '</div>' +
+    '</div>';
+  return { html: html, mount: function () {
+    $('#xedit').onclick = function () { $('#xjob').focus(); };
+    $('#xignore').onclick = function () { history.back(); };
+    $('#xconfirm').onclick = function () {
+      var now = new Date();
+      doc.imports.push({
+        id: 'X' + now.getTime().toString(36).toUpperCase(),
+        docId: doc.id,
+        fields: readExtractFields(),
+        status: 'CONFIRMED',
+        confirmedAt: now.toISOString(),
+        confirmedBy: DB.data.currentEmployee
+      });
+      DB.save();
+      good();
+      go('doc-view', doc.id);
+    };
+  }};
+};
+
+/* DOCUMENTS section for the Roll History screen. */
+function docsHtml(docs) {
+  return docs.map(function (d) {
+    return '<div class="ledger-row"><img class="doc-thumb" src="' + d.thumb + '" alt="History card thumbnail">' +
+      '<div class="what"><b>HISTORY CARD #' + d.num + '</b> <span class="srcchip">PAPER CARD</span>' +
+      '<div class="sub">' + esc(d.date) + ' &middot; ' + esc(d.employee) +
+      (d.location ? ' &middot; loc <span class="mono">' + esc(d.location) + '</span>' : '') +
+      ((d.imports || []).length ? ' &middot; ' + d.imports.length + ' import' + (d.imports.length > 1 ? 's' : '') : '') +
+      '</div></div>' +
+      '<div class="bal"><button class="btn btn-xs" data-docview="' + esc(d.id) + '">VIEW</button></div></div>';
+  }).join('');
+}
+
+/* Wire every "VIEW DOCUMENT" / "VIEW" button rendered by ledgerHtml/docsHtml. */
+function wireDocViews() {
+  Array.prototype.forEach.call(document.querySelectorAll('[data-docview]'), function (b) {
+    b.onclick = function () { go('doc-view', b.getAttribute('data-docview')); };
+  });
+}
 
 /* ---------------- RAPID CYCLE COUNT ----------------------------------------------
    Built for walking the rows: SCAN LOCATION once, then SCAN -> TYPE BALANCE ->
@@ -1970,7 +2387,7 @@ Screens.dashboard = function () {
     '<div class="card">' +
       '<button class="btn btn-huge" id="gotestbal">&#9874; SET TEST SYSTEM BALANCE</button>' +
       '<button class="btn btn-red btn-huge" id="resetcounts">RESET TEST DATA</button>' +
-      '<p class="hint">Reset test data clears <b>cycle counts and measured-balance (MB) markers</b> &mdash; rolls, cuts, test balances, and the barcode scanner are untouched.</p>' +
+      '<p class="hint">Reset test data clears <b>cycle counts and measured-balance (MB) markers</b> &mdash; rolls, cuts, history cards, Free Run data, test balances, and the barcode scanner are untouched.</p>' +
     '</div>' +
     '<div class="foot"><button class="linklike" id="resetdemo">Reset demo data</button></div>' +
     '</div>';
