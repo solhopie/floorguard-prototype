@@ -62,27 +62,27 @@ var DB = {
         { id: 'C-SEED-1', rollId: 'QH5CPHN', style: 'Venture Solid', color: 'Soft Taupe',
           widthIn: 144, expectedLocation: '205B', scannedLocation: '205B',
           expectedIn: 536, physicalIn: 533, diffIn: -3,
-          employee: 'Marcus', at: at(2 * H), status: 'SHORT', flagged: false },
+          employee: 'Marcus', at: at(2 * H), status: 'SHORT', flagged: false, measured: true },
         { id: 'C-SEED-2', rollId: 'TK7M2QA', style: 'EverStrand Soft', color: 'Harbor Gray',
           widthIn: 144, expectedLocation: '205A', scannedLocation: '205A',
           expectedIn: 1240, physicalIn: 1240, diffIn: 0,
-          employee: 'Dana', at: at(5 * H), status: 'MATCH', flagged: false },
+          employee: 'Dana', at: at(5 * H), status: 'MATCH', flagged: false, measured: true },
         { id: 'C-SEED-3', rollId: 'TK7M2QA', style: 'EverStrand Soft', color: 'Harbor Gray',
           widthIn: 144, expectedLocation: '205A', scannedLocation: '205A',
           expectedIn: 1240, physicalIn: 1240, diffIn: 0,
-          employee: 'Luis', at: at(0.5 * H), status: 'MATCH', flagged: false },
+          employee: 'Luis', at: at(0.5 * H), status: 'MATCH', flagged: false, measured: true },
         { id: 'C-SEED-4', rollId: 'PL9XD4R', style: 'Pure Earth', color: 'Desert Sand',
           widthIn: 180, expectedLocation: '206B', scannedLocation: '206B',
           expectedIn: 1320, physicalIn: 1350, diffIn: 30,
-          employee: 'Luis', at: at(3 * H), status: 'OVER', flagged: false },
+          employee: 'Luis', at: at(3 * H), status: 'OVER', flagged: false, measured: true },
         { id: 'C-SEED-5', rollId: 'MN3KP8W', style: 'Tuftex Nylon', color: 'Midnight Blue',
           widthIn: 144, expectedLocation: '206A', scannedLocation: '206B',
           expectedIn: 1560, physicalIn: 1560, diffIn: 0,
-          employee: 'Dana', at: at(1 * H), status: 'LOCATION_MISMATCH', flagged: false },
+          employee: 'Dana', at: at(1 * H), status: 'LOCATION_MISMATCH', flagged: false, measured: true },
         { id: 'C-SEED-6', rollId: 'QW8ZV2N', style: 'Karastan Wool', color: 'Ivory White',
           widthIn: 162, expectedLocation: '204B', scannedLocation: '204A',
           expectedIn: 1200, physicalIn: 1190, diffIn: -10,
-          employee: 'Marcus', at: at(0.75 * H), status: 'NEEDS_REVIEW', flagged: true }
+          employee: 'Marcus', at: at(0.75 * H), status: 'NEEDS_REVIEW', flagged: true, measured: true }
       ]
     };
   },
@@ -182,6 +182,24 @@ function systemBalance(rollId) {
   return roll.beginningIn - used;
 }
 function isTestBalance(roll) { return !!(roll && roll.testBalanceIn != null); }
+
+/* A count is a physical measurement (MB) when it carries a measured balance.
+   Counts recorded before the MB flag existed have no flag but are still real
+   physical measurements — only mismatch-only flags (physicalIn null) are not. */
+function isMeasuredCount(c) { return !!(c && (c.measured || c.physicalIn != null)); }
+
+/* Rolls whose latest physical measurement differs from the expected balance.
+   Shared by the Discrepancies screen and the dashboard badge so both agree. */
+function discrepancyRolls() {
+  var latest = {};
+  DB.data.counts.forEach(function (c) {
+    if (!isMeasuredCount(c)) return;
+    if (!latest[c.rollId] || new Date(c.at) > new Date(latest[c.rollId].at)) latest[c.rollId] = c;
+  });
+  return Object.keys(latest).map(function (k) { return latest[k]; })
+    .filter(function (c) { return c.diffIn !== 0; })
+    .sort(function (a, b) { return new Date(b.at) - new Date(a.at); });
+}
 
 /* ---------------- Roll data model ------------------------------------------------
    Roll ID, Barcode, Style, Color, Width, Current Location live on the roll record.
@@ -1147,7 +1165,7 @@ Screens.roll = function (param) {
 function ledgerHtml(roll) {
   var ev = [];
   DB.data.cuts.forEach(function (c) {
-    if (c.rollId === roll.id) ev.push({ kind: 'cut', at: c.at, inches: c.inches, by: c.by });
+    if (c.rollId === roll.id) ev.push({ kind: 'cut', at: c.at, inches: c.inches, by: c.by, order: c.order, newIn: c.newIn });
   });
   DB.data.counts.forEach(function (c) {
     if (c.rollId === roll.id) ev.push({ kind: 'count', at: c.at, rec: c });
@@ -1159,8 +1177,11 @@ function ledgerHtml(roll) {
   var bal = roll.beginningIn;
   ev.forEach(function (e) {
     if (e.kind === 'cut') {
-      bal -= e.inches;
-      var newBal = (e.newIn != null) ? e.newIn : bal;
+      /* Prefer the balance stored on the cut record (exact at cut time, and it
+         already accounts for any test-balance adjustment); fall back to the
+         running calculation only for legacy records that lack it. */
+      var newBal = (e.newIn != null) ? e.newIn : (bal - e.inches);
+      bal = newBal;
       var orderTag = e.order ? ' <span class="mono">Order ' + esc(e.order) + '</span>' : '';
       out += '<div class="ledger-row"><span class="dot" style="background:var(--blue)"></span>' +
         '<div class="what"><b>Cut</b> <span class="num">' + fmtLen(e.inches) + '</span>' + orderTag +
@@ -1171,7 +1192,7 @@ function ledgerHtml(roll) {
       var phys = (r.physicalIn == null) ? '—' : fmtLen(r.physicalIn);
       var ddiff = (r.diffIn == null) ? '—' : fmtDiff(r.diffIn);
       var dcls = (r.diffIn == null) ? '' : diffCls(r.diffIn);
-      var mb = r.measured ? ' <span class="stchip st-green">MB ✓</span>' : '';
+      var mb = isMeasuredCount(r) ? ' <span class="stchip st-green">MB ✓</span>' : '';
       out += '<div class="ledger-row"><span class="dot" style="background:' +
         (r.status === 'MATCH' ? 'var(--green)' : r.status === 'NEEDS_REVIEW' ? 'var(--yellow)' : 'var(--red)') + '"></span>' +
         '<div class="what"><b>Physical Cycle Count</b> <span class="num">' + phys + '</span> ' + statusChip(r.status) + mb +
@@ -1197,7 +1218,7 @@ Screens.recent = function () {
 function countRow(c) {
   var date = c.date || new Date(c.at).toLocaleDateString();
   var time = c.time || fmtTime(c.at);
-  var mb = c.measured ? ' <span class="stchip st-green">MB ✓</span>' : '';
+  var mb = isMeasuredCount(c) ? ' <span class="stchip st-green">MB ✓</span>' : '';
   var balLine = (c.physicalIn == null)
     ? '<div class="sub">mismatch flagged — not measured</div>'
     : '<div class="sub num">Sys <b>' + fmtLen(c.expectedIn) + '</b> &middot; Phys <b>' + fmtLen(c.physicalIn) + '</b>' +
@@ -1567,7 +1588,7 @@ Screens.dashboard = function () {
     '</div>' +
     '<h2>Counts by employee</h2><div class="card">' + empRows + '</div>' +
     '<button class="btn btn-huge" id="godisc">&#9888; CYCLE COUNT DISCREPANCIES' +
-    (n('SHORT') + n('OVER') ? ' (' + (n('SHORT') + n('OVER')) + ' today)' : '') + '</button>' +
+    (discrepancyRolls().length ? ' (' + discrepancyRolls().length + ')' : '') + '</button>' +
     '<h2>Search &amp; filter</h2>' +
     '<div class="field"><input class="input" id="dq" autocomplete="off" placeholder="Roll, location, style, color, employee, date&hellip;"></div>' +
     '<div class="chiprow" id="dchips"><button class="fchip on" data-f="">ALL</button>' + chips + '</div>' +
@@ -1630,15 +1651,7 @@ Screens.dashboard = function () {
    expected balance. Discrepancies are recorded for review — reviewing never
    changes the expected balance; that only happens through cut transactions. */
 Screens.discrepancies = function () {
-  var latest = {};
-  DB.data.counts.forEach(function (c) {
-    /* latest measured count per roll (skip mismatch-only flags with no measurement) */
-    if (!c.measured || c.physicalIn == null) return;
-    if (!latest[c.rollId] || new Date(c.at) > new Date(latest[c.rollId].at)) latest[c.rollId] = c;
-  });
-  var rows = Object.keys(latest).map(function (k) { return latest[k]; })
-    .filter(function (c) { return c.diffIn !== 0; })
-    .sort(function (a, b) { return new Date(b.at) - new Date(a.at); });
+  var rows = discrepancyRolls();
   var html =
     '<div class="screen">' +
     '<div class="step-head">SUPERVISOR</div>' +

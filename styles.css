@@ -115,7 +115,7 @@ p.hint { color: var(--muted); }
 
 /* ---------- status chips ---------- */
 .stchip {
-  display: inline-block; padding: 6px 14px; border-radius: 999px;
+  display: inline-block; padding: 6px 14px; border-radius: 999px; margin-left: 6px;
   font-weight: 900; letter-spacing: 1px; font-size: 0.9rem; color: #fff;
 }
 .st-green { background: var(--green); color: #052e12; }
