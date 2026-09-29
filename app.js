@@ -114,9 +114,22 @@ function rollById(id) {
 }
 function rollByBarcode(code) {
   var c = String(code || '').trim().toUpperCase();
-  return DB.data.rolls.filter(function (r) {
-    return r.barcode.toUpperCase() === c || r.id.toUpperCase() === c;
-  })[0] || null;
+  var rolls = DB.data.rolls;
+  var i, r;
+  for (i = 0; i < rolls.length; i++) {
+    r = rolls[i];
+    if (r.barcode.toUpperCase() === c || r.id.toUpperCase() === c) return r;
+  }
+  /* Manufacturer tags often prefix the roll number (e.g. "01" + roll # on the
+     printed tag). Retry with common prefixes stripped before giving up. */
+  var stripped = c.replace(/^01/, '');
+  if (stripped !== c && stripped) {
+    for (i = 0; i < rolls.length; i++) {
+      r = rolls[i];
+      if (r.barcode.toUpperCase() === stripped || r.id.toUpperCase() === stripped) return r;
+    }
+  }
+  return null;
 }
 /* System balance = beginning length minus all recorded cuts.
    Cycle counts never change it. */
@@ -515,8 +528,13 @@ Screens['scan-roll'] = function () {
     }
     good();
     S.roll = roll;
+    var scanned = String(code || '').trim().toUpperCase();
+    var scannedRow = (scanned && scanned !== roll.barcode.toUpperCase() && scanned !== roll.id.toUpperCase())
+      ? '<div class="kv"><span class="k">Scanned code</span><span class="v mono">' + esc(scanned) + '</span></div>'
+      : '';
     $('#result').innerHTML =
       '<div class="ok-panel"><div class="big-ok">&#9989; ROLL IDENTIFIED</div>' +
+      scannedRow +
       '<div class="kv"><span class="k">Roll #</span><span class="v mono">' + esc(roll.id) + '</span></div>' +
       '<div class="kv"><span class="k">Style</span><span class="v">' + esc(roll.style) + '</span></div>' +
       '<div class="kv"><span class="k">Color</span><span class="v">' + esc(roll.color) + '</span></div>' +
