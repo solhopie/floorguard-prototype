@@ -33,7 +33,7 @@ app feel (PWA manifest included).
 
 ## Flow
 
-Home → START CYCLE COUNT → scan roll → scan 98 location → duplicate check →
+Home → START CYCLE COUNT → scan roll → scan location → duplicate check →
 enter physical balance (ft/in or decimal ft) → confirm → SUBMIT → saved.
 Statuses: MATCH / SHORT / OVER / LOCATION MISMATCH / NEEDS REVIEW.
 Supervisor dashboard, roll search, per-roll history ledger, and append-only

@@ -33,22 +33,22 @@ var DB = {
       rolls: [
         { id: 'QH5CPHN', barcode: 'QH5CPHN', manufacturer: 'Shaw Industries',
           style: 'Venture Solid', color: 'Soft Taupe', widthIn: 144,
-          beginningIn: 1801, expectedLocation: '98-A-01' },
+          beginningIn: 1801, expectedLocation: '205B' },
         { id: 'TK7M2QA', barcode: 'TK7M2QA', manufacturer: 'Mohawk Industries',
           style: 'EverStrand Soft', color: 'Harbor Gray', widthIn: 144,
-          beginningIn: 1440, expectedLocation: '98-A-02' },
+          beginningIn: 1440, expectedLocation: '205A' },
         { id: 'PL9XD4R', barcode: 'PL9XD4R', manufacturer: 'DreamWeaver',
           style: 'Pure Earth', color: 'Desert Sand', widthIn: 180,
-          beginningIn: 1680, expectedLocation: '98-B-01' },
+          beginningIn: 1680, expectedLocation: '206B' },
         { id: 'MN3KP8W', barcode: 'MN3KP8W', manufacturer: 'Shaw Industries',
           style: 'Tuftex Nylon', color: 'Midnight Blue', widthIn: 144,
-          beginningIn: 1560, expectedLocation: '98-B-02' },
+          beginningIn: 1560, expectedLocation: '206A' },
         { id: 'QW8ZV2N', barcode: 'QW8ZV2N', manufacturer: 'Phenix Flooring',
           style: 'Karastan Wool', color: 'Ivory White', widthIn: 162,
-          beginningIn: 1320, expectedLocation: '98-C-01' },
+          beginningIn: 1320, expectedLocation: '204B' },
         { id: 'ZX4LM7B', barcode: 'ZX4LM7B', manufacturer: 'Stanton Carpet',
           style: 'Atelier Wool', color: 'Charcoal', widthIn: 144,
-          beginningIn: 1200, expectedLocation: '98-C-02' }
+          beginningIn: 1200, expectedLocation: '204A' }
       ],
       cuts: [
         { id: 'K1', rollId: 'QH5CPHN', inches: 323, at: at(3 * D + 5 * H), by: 'Marcus' }, // 26' 11"
@@ -60,27 +60,27 @@ var DB = {
       ],
       counts: [
         { id: 'C-SEED-1', rollId: 'QH5CPHN', style: 'Venture Solid', color: 'Soft Taupe',
-          widthIn: 144, expectedLocation: '98-A-01', scannedLocation: '98-A-01',
+          widthIn: 144, expectedLocation: '205B', scannedLocation: '205B',
           expectedIn: 536, physicalIn: 533, diffIn: -3,
           employee: 'Marcus', at: at(2 * H), status: 'SHORT', flagged: false },
         { id: 'C-SEED-2', rollId: 'TK7M2QA', style: 'EverStrand Soft', color: 'Harbor Gray',
-          widthIn: 144, expectedLocation: '98-A-02', scannedLocation: '98-A-02',
+          widthIn: 144, expectedLocation: '205A', scannedLocation: '205A',
           expectedIn: 1240, physicalIn: 1240, diffIn: 0,
           employee: 'Dana', at: at(5 * H), status: 'MATCH', flagged: false },
         { id: 'C-SEED-3', rollId: 'TK7M2QA', style: 'EverStrand Soft', color: 'Harbor Gray',
-          widthIn: 144, expectedLocation: '98-A-02', scannedLocation: '98-A-02',
+          widthIn: 144, expectedLocation: '205A', scannedLocation: '205A',
           expectedIn: 1240, physicalIn: 1240, diffIn: 0,
           employee: 'Luis', at: at(0.5 * H), status: 'MATCH', flagged: false },
         { id: 'C-SEED-4', rollId: 'PL9XD4R', style: 'Pure Earth', color: 'Desert Sand',
-          widthIn: 180, expectedLocation: '98-B-01', scannedLocation: '98-B-01',
+          widthIn: 180, expectedLocation: '206B', scannedLocation: '206B',
           expectedIn: 1320, physicalIn: 1350, diffIn: 30,
           employee: 'Luis', at: at(3 * H), status: 'OVER', flagged: false },
         { id: 'C-SEED-5', rollId: 'MN3KP8W', style: 'Tuftex Nylon', color: 'Midnight Blue',
-          widthIn: 144, expectedLocation: '98-B-02', scannedLocation: '98-B-03',
+          widthIn: 144, expectedLocation: '206A', scannedLocation: '206B',
           expectedIn: 1560, physicalIn: 1560, diffIn: 0,
           employee: 'Dana', at: at(1 * H), status: 'LOCATION_MISMATCH', flagged: false },
         { id: 'C-SEED-6', rollId: 'QW8ZV2N', style: 'Karastan Wool', color: 'Ivory White',
-          widthIn: 162, expectedLocation: '98-C-01', scannedLocation: '98-C-02',
+          widthIn: 162, expectedLocation: '204B', scannedLocation: '204A',
           expectedIn: 1200, physicalIn: 1190, diffIn: -10,
           employee: 'Marcus', at: at(0.75 * H), status: 'NEEDS_REVIEW', flagged: true }
       ]
@@ -112,6 +112,10 @@ var DB = {
 function rollById(id) {
   return DB.data.rolls.filter(function (r) { return r.id === id; })[0] || null;
 }
+/* Location codes are compared case-insensitively with stray spaces trimmed:
+   "205b" and " 205B " both mean 205B. The scanned barcode value is
+   authoritative — no format or prefix is required. */
+function normLoc(s) { return String(s || '').trim().toUpperCase(); }
 function rollByBarcode(code) {
   var c = String(code || '').trim().toUpperCase();
   var rolls = DB.data.rolls;
@@ -150,13 +154,6 @@ function recentCountForRoll(rollId, withinMs) {
     return (Date.now() - new Date(c.at).getTime()) <= withinMs;
   });
   return list.length ? list[list.length - 1] : null;
-}
-function allLocations() {
-  var seen = {}, out = [];
-  DB.data.rolls.forEach(function (r) {
-    if (!seen[r.expectedLocation]) { seen[r.expectedLocation] = 1; out.push(r.expectedLocation); }
-  });
-  return out.sort();
 }
 
 /* ---------------- formatting ---------------------------------------------- */
@@ -210,7 +207,7 @@ function statusChip(status) {
 }
 /* Location mismatch always wins over the balance comparison. */
 function computeStatus(roll, scannedLoc, physicalIn, flagged) {
-  if (scannedLoc !== roll.expectedLocation) {
+  if (normLoc(scannedLoc) !== normLoc(roll.expectedLocation)) {
     return flagged ? 'NEEDS_REVIEW' : 'LOCATION_MISMATCH';
   }
   var diff = physicalIn - systemBalance(roll.id);
@@ -572,22 +569,23 @@ function mountScannerBox(boxId, onCode) {
   });
 }
 
-/* ---------------- SCAN 98 LOCATION (step 2) ---------------------------------- */
+/* ---------------- SCAN LOCATION (step 2) ------------------------------------- */
 Screens['scan-loc'] = function () {
   if (!needRoll()) return { html: '' };
   S.scannedLoc = null;
-  var chips = allLocations().map(function (l) {
+  /* Demo/test values only — real locations come from the scanned barcode. */
+  var chips = ['205A', '205B', '206A', '206B', '204A', '204B'].map(function (l) {
     return '<button class="demochip" data-code="' + esc(l) + '">' + esc(l) + '</button>';
-  }).join('') + '<button class="demochip" data-code="98-Z-99">98-Z-99 (wrong)</button>';
+  }).join('');
   var html =
     '<div class="screen">' +
-    '<div class="step-head">STEP 2 OF 4 &mdash; SCAN 98 LOCATION</div>' +
+    '<div class="step-head">STEP 2 OF 4 &mdash; SCAN LOCATION</div>' +
     '<h1>Scan the location barcode</h1>' +
-    '<p class="hint">Roll <b class="mono">' + esc(S.roll.id) + '</b> &mdash; scan the <b>98</b> location tag where it sits.</p>' +
+    '<p class="hint">Roll <b class="mono">' + esc(S.roll.id) + '</b> &mdash; scan the location tag where it sits.</p>' +
     '<div class="cambox" id="cambox"><div class="camnote">Starting camera&hellip;</div></div>' +
     '<form id="manualform"><div class="field">' +
       '<label class="label" for="manual">OR TYPE / WEDGE THE LOCATION CODE</label>' +
-      '<input class="input mono" id="manual" autocomplete="off" autocapitalize="characters" placeholder="e.g. 98-A-01">' +
+      '<input class="input mono" id="manual" autocomplete="off" autocapitalize="characters" placeholder="e.g. 205B">' +
     '</div>' +
     '<button class="btn btn-primary btn-huge" type="submit">ENTER CODE</button></form>' +
     '<div class="demolabel">DEMO &mdash; TAP TO SIMULATE A SCAN</div>' +
@@ -603,7 +601,7 @@ Screens['scan-loc'] = function () {
   }};
 
   function onCode(code) {
-    var loc = String(code || '').trim().toUpperCase();
+    var loc = normLoc(code);
     if (!loc) {
       bad();
       $('#result').innerHTML = '<div class="err center" style="font-size:1.3rem">&#10060; EMPTY SCAN &mdash; try again.</div>';
@@ -741,7 +739,7 @@ Screens.balance = function () {
       if (err) { bad(); var e = $('#balerr'); e.textContent = err; e.hidden = false; return; }
       S.physicalIn = total;
       good();
-      go(S.scannedLoc !== S.roll.expectedLocation ? 'mismatch' : 'confirm');
+      go(normLoc(S.scannedLoc) !== normLoc(S.roll.expectedLocation) ? 'mismatch' : 'confirm');
     };
   }};
 };
@@ -781,7 +779,7 @@ Screens.confirm = function () {
 /* ---------------- LOCATION MISMATCH warning ----------------------------------- */
 Screens.mismatch = function () {
   if (!needBalance()) return { html: '' };
-  if (S.scannedLoc === S.roll.expectedLocation) { setTimeout(function () { go('confirm'); }, 0); return { html: '' }; }
+  if (normLoc(S.scannedLoc) === normLoc(S.roll.expectedLocation)) { setTimeout(function () { go('confirm'); }, 0); return { html: '' }; }
   var roll = S.roll;
   var html =
     '<div class="screen">' +
