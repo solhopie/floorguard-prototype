@@ -27,7 +27,7 @@ var DB = {
     var at = function (msAgo) { return new Date(now - msAgo).toISOString(); };
 
     return {
-      v: 1,
+      v: 2,
       employees: ['Marcus', 'Dana', 'Luis'],
       currentEmployee: 'Marcus',
       rolls: [
@@ -92,7 +92,15 @@ var DB = {
       var raw = localStorage.getItem(this.KEY);
       if (raw) {
         var d = JSON.parse(raw);
-        if (d && d.v === 1) { this.data = d; return d; }
+        if (d && d.v === 1) {
+          /* Migrate phones that seeded before the location-system correction:
+             rewrite the old 98-* codes to the real warehouse codes, keep every
+             saved count, then persist as v2. */
+          this.data = migrateV1Locations(d);
+          this.save();
+          return this.data;
+        }
+        if (d && d.v === 2) { this.data = d; return d; }
       }
     } catch (e) { /* storage unavailable -> seed in memory */ }
     this.data = this.seed();
@@ -107,6 +115,28 @@ var DB = {
 
   reset: function () { this.data = this.seed(); this.save(); }
 };
+
+/* One-way migration for data seeded before the location-system correction
+   (v1 used 98-* location codes; v2 uses the real warehouse codes). Saved
+   counts are preserved — only the location strings are rewritten. */
+function migrateV1Locations(d) {
+  var map = {
+    '98-A-01': '205B', '98-A-02': '205A',
+    '98-B-01': '206B', '98-B-02': '206A', '98-B-03': '206B',
+    '98-C-01': '204B', '98-C-02': '204A'
+  };
+  var fix = function (loc) {
+    var n = normLoc(loc);
+    return map[n] || loc;
+  };
+  (d.rolls || []).forEach(function (r) { r.expectedLocation = fix(r.expectedLocation); });
+  (d.counts || []).forEach(function (c) {
+    c.expectedLocation = fix(c.expectedLocation);
+    c.scannedLocation = fix(c.scannedLocation);
+  });
+  d.v = 2;
+  return d;
+}
 
 /* ---------------- query helpers (screens use these, not raw storage) ------ */
 function rollById(id) {
