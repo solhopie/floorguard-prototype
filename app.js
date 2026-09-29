@@ -51,12 +51,12 @@ var DB = {
           beginningIn: 1200, expectedLocation: '204A' }
       ],
       cuts: [
-        { id: 'K1', rollId: 'QH5CPHN', inches: 323, at: at(3 * D + 5 * H), by: 'Marcus' }, // 26' 11"
-        { id: 'K2', rollId: 'QH5CPHN', inches: 444, at: at(2 * D + 3 * H), by: 'Dana' },   // 37'
-        { id: 'K3', rollId: 'QH5CPHN', inches: 498, at: at(1 * D + 6 * H), by: 'Marcus' }, // 41' 6"
-        { id: 'K4', rollId: 'TK7M2QA', inches: 200, at: at(2 * D + 8 * H), by: 'Dana' },
-        { id: 'K5', rollId: 'PL9XD4R', inches: 360, at: at(4 * D + 2 * H), by: 'Luis' },
-        { id: 'K6', rollId: 'QW8ZV2N', inches: 120, at: at(5 * D + 4 * H), by: 'Marcus' }
+        { id: 'K1', rollId: 'QH5CPHN', barcode: 'QH5CPHN', order: 'XS024531', inches: 323, prevIn: 1801, newIn: 1478, location: '205B', at: at(3 * D + 5 * H), by: 'Marcus' }, // 26' 11"
+        { id: 'K2', rollId: 'QH5CPHN', barcode: 'QH5CPHN', order: 'XS024532', inches: 444, prevIn: 1478, newIn: 1034, location: '205B', at: at(2 * D + 3 * H), by: 'Dana' },   // 37'
+        { id: 'K3', rollId: 'QH5CPHN', barcode: 'QH5CPHN', order: 'XS024536', inches: 498, prevIn: 1034, newIn: 536, location: '205B', at: at(1 * D + 6 * H), by: 'Marcus' }, // 41' 6"
+        { id: 'K4', rollId: 'TK7M2QA', barcode: 'TK7M2QA', order: 'XS024540', inches: 200, prevIn: 1440, newIn: 1240, location: '205A', at: at(2 * D + 8 * H), by: 'Dana' },
+        { id: 'K5', rollId: 'PL9XD4R', barcode: 'PL9XD4R', order: 'XS024541', inches: 360, prevIn: 1680, newIn: 1320, location: '206B', at: at(4 * D + 2 * H), by: 'Luis' },
+        { id: 'K6', rollId: 'QW8ZV2N', barcode: 'QW8ZV2N', order: 'XS024544', inches: 120, prevIn: 1320, newIn: 1200, location: '204B', at: at(5 * D + 4 * H), by: 'Marcus' }
       ],
       counts: [
         { id: 'C-SEED-1', rollId: 'QH5CPHN', style: 'Venture Solid', color: 'Soft Taupe',
@@ -182,6 +182,64 @@ function systemBalance(rollId) {
   return roll.beginningIn - used;
 }
 function isTestBalance(roll) { return !!(roll && roll.testBalanceIn != null); }
+
+/* ---------------- Roll data model ------------------------------------------------
+   Roll ID, Barcode, Style, Color, Width, Current Location live on the roll record.
+   CURRENT EXPECTED BALANCE is never stored — it is calculated from transactions:
+     starting balance (beginningIn) - sum of cuts = expected balance
+   (or the temporary pilot testBalanceIn override when a supervisor set one).
+   MEASURED BALANCE (MB): roll.measuredIn / measuredAt / measuredBy are stamped
+   every time a worker physically measures the roll during a cycle count.
+   Cut History = DB.data.cuts for the roll. Cycle Count History = DB.data.counts
+   for the roll. History is append-only: records are never edited or deleted.
+   A discrepancy NEVER changes the expected balance — it is recorded and queued
+   for supervisor review on the Discrepancies screen. */
+
+/* ---------------- Cut transaction service (integration seam) ----------------------
+   ALL cut transactions go through CutService.recordCut() — the prototype UI and
+   any future integration alike. Manual entry is the prototype path.
+   FUTURE REAL FLOORS INTEGRATION: when Real Floors records an order/cut, an
+   approved API/data integration calls CutService.recordCut() with the cut
+   details, and FloorGuard updates the expected balance automatically — the
+   employee must NOT enter the same cut twice. Keep this function separate from
+   the UI so the integration can replace manual entry without touching screens.
+   Do NOT attempt to access or imitate a private Real Floors system. */
+var CutService = {
+  /* opts: { rollId, order, cutIn, employee, location }
+     Returns { ok:true, rec } or { ok:false, err }. */
+  recordCut: function (opts) {
+    var roll = rollById(opts.rollId);
+    if (!roll) return { ok: false, err: 'Roll not found.' };
+    var order = String(opts.order || '').trim().toUpperCase();
+    if (!order) return { ok: false, err: 'Enter the order number.' };
+    var cutIn = Math.round(Number(opts.cutIn));
+    if (!isFinite(cutIn) || cutIn <= 0) return { ok: false, err: 'Cut length must be more than zero.' };
+    var prevIn = systemBalance(roll.id);
+    if (cutIn > prevIn) return { ok: false, err: 'Cut (' + fmtLen(cutIn) + ') exceeds the current balance (' + fmtLen(prevIn) + ').' };
+    var now = new Date();
+    var rec = {
+      id: 'K' + Date.now().toString(36).toUpperCase(),
+      rollId: roll.id, barcode: roll.barcode, order: order,
+      prevIn: prevIn, inches: cutIn, newIn: prevIn - cutIn,
+      location: opts.location || roll.expectedLocation,
+      by: opts.employee || DB.data.currentEmployee,
+      at: now.toISOString(), date: now.toLocaleDateString(), time: fmtTime(now.toISOString())
+    };
+    DB.data.cuts.push(rec); /* append-only: cut history is never edited or deleted */
+    /* Keep a supervisor's temporary test balance in sync with recorded cuts. */
+    if (roll.testBalanceIn != null) roll.testBalanceIn = Math.max(0, roll.testBalanceIn - cutIn);
+    DB.save();
+    return { ok: true, rec: rec };
+  },
+  recentOrders: function () {
+    var seen = {}, out = [];
+    DB.data.cuts.slice().sort(function (a, b) { return new Date(b.at) - new Date(a.at); })
+      .forEach(function (c) {
+        if (c.order && !seen[c.order]) { seen[c.order] = 1; out.push(c.order); }
+      });
+    return out.slice(0, 8);
+  }
+};
 function countsForRoll(rollId) {
   return DB.data.counts
     .filter(function (c) { return c.rollId === rollId; })
@@ -426,6 +484,16 @@ var lastSavedId = null;
 function newSession() {
   S = { roll: null, scannedLoc: null, physicalIn: null, flagged: false };
 }
+/* Cut-transaction session. */
+var C = null;
+function newCutSession() {
+  C = { roll: null, order: '', cutIn: null };
+}
+/* Rapid cycle-count session: one active location, then roll after roll. */
+var R = null;
+function newRapid() {
+  R = { activeLoc: null, scan: null, lastMsg: null };
+}
 
 function parseHash() {
   var h = (location.hash || '').replace(/^#\/?/, '');
@@ -442,7 +510,11 @@ var TITLES = {
   mismatch: 'Location Mismatch', saved: 'Count Saved', search: 'Search Roll',
   roll: 'Roll History', recent: 'Recent Counts', count: 'Count Detail',
   dashboard: 'Supervisor Dashboard', employee: 'Who Is Counting?',
-  testbal: 'Set Test Balance', testbaledit: 'Edit Test Balance'
+  testbal: 'Set Test Balance', testbaledit: 'Edit Test Balance',
+  'cut-scan': 'Cut — Scan Roll', 'cut-entry': 'Cut — Enter Cut', 'cut-saved': 'Cut Saved',
+  'rapid-loc': 'Rapid — Scan Location', 'rapid-scan': 'Rapid Cycle Count',
+  'rapid-balance': 'Rapid — Enter Balance', 'rapid-mismatch': 'Location Mismatch',
+  discrepancies: 'Cycle Count Discrepancies'
 };
 
 function render() {
@@ -480,6 +552,8 @@ Screens.home = function () {
     '</div>' +
     '<button class="btn" id="empchip">&#128100; ' + emp + ' &#9662;</button>' +
     '<button class="btn btn-primary btn-home" id="b-start">&#9654; START CYCLE COUNT</button>' +
+    '<button class="btn btn-home" id="b-rapid">&#9889; RAPID CYCLE COUNT</button>' +
+    '<button class="btn btn-home" id="b-cut">&#9986; CUT / UPDATE ROLL</button>' +
     '<button class="btn btn-home" id="b-search">&#128269; SEARCH ROLL</button>' +
     '<button class="btn btn-home" id="b-recent">&#9776; RECENT COUNTS</button>' +
     '<button class="btn btn-home" id="b-dash">&#128202; SUPERVISOR DASHBOARD</button>' +
@@ -488,6 +562,8 @@ Screens.home = function () {
   return { html: html, mount: function () {
     $('#empchip').onclick = function () { go('employee'); };
     $('#b-start').onclick = function () { newSession(); go('scan-roll'); };
+    $('#b-rapid').onclick = function () { newRapid(); go('rapid-loc'); };
+    $('#b-cut').onclick = function () { newCutSession(); go('cut-scan'); };
     $('#b-search').onclick = function () { go('search'); };
     $('#b-recent').onclick = function () { go('recent'); };
     $('#b-dash').onclick = function () { go('dashboard'); };
@@ -846,17 +922,168 @@ function submitCount(flagged) {
     rollId: roll.id, barcode: roll.barcode, style: roll.style, color: roll.color, widthIn: roll.widthIn,
     expectedLocation: roll.expectedLocation, scannedLocation: S.scannedLoc,
     expectedIn: sys, physicalIn: S.physicalIn, diffIn: diff,
+    measured: true, /* MB: worker physically measured this roll */
     employee: DB.data.currentEmployee, at: now.toISOString(),
     date: now.toLocaleDateString(), time: fmtTime(now.toISOString()),
     status: status, flagged: !!flagged
   };
   DB.data.counts.push(rec); /* append-only: records are never edited or deleted */
+  /* Stamp the roll's measured-balance fields so supervisors can distinguish
+     the calculated/system balance from the last physical measurement. */
+  roll.measuredIn = S.physicalIn;
+  roll.measuredAt = rec.at;
+  roll.measuredBy = rec.employee;
   DB.save();
   S = null;
   lastSavedId = rec.id;
   if (status === 'MATCH') good(); else if (status === 'NEEDS_REVIEW') warn(); else bad();
   go('saved', rec.id);
 }
+
+/* ---------------- CUT TRANSACTION MODE -------------------------------------------
+   SCAN ROLL -> SHOW CURRENT BALANCE -> ORDER NUMBER -> CUT LENGTH ->
+   NEW BALANCE -> SAVE CUT -> READY STATE.
+   The barcode identifies the ROLL only; the balance lives in the database and is
+   recalculated from the cut history, so the same barcode stays on the roll for
+   its whole life. All writes go through CutService.recordCut() (the Real Floors
+   integration seam). The scanner implementation below is untouched — the shared
+   mountScannerBox wiring is reused, not rebuilt. */
+Screens['cut-scan'] = function () {
+  if (!C) newCutSession();
+  var chips = DB.data.rolls.map(function (r) {
+    return '<button class="demochip" data-code="' + esc(r.barcode) + '">' + esc(r.barcode) + '</button>';
+  }).join('');
+  var html =
+    '<div class="screen">' +
+    '<div class="step-head">CUT TRANSACTION &mdash; SCAN ROLL</div>' +
+    '<h1>Scan roll barcode</h1>' +
+    '<p class="hint">Scan the roll to cut. The barcode identifies the roll &mdash; the current balance comes from the database.</p>' +
+    '<div class="cambox" id="cambox"><div class="camnote">Starting camera&hellip;</div></div>' +
+    '<form id="manualform"><div class="field">' +
+      '<label class="label" for="manual">OR TYPE / WEDGE THE BARCODE</label>' +
+      '<input class="input mono" id="manual" autocomplete="off" autocapitalize="characters" placeholder="e.g. QH5CPHN">' +
+    '</div>' +
+    '<button class="btn btn-primary btn-huge" type="submit">ENTER CODE</button></form>' +
+    '<div class="demolabel">DEMO &mdash; TAP TO SIMULATE A SCAN</div>' +
+    '<div class="demochips">' + chips + '</div>' +
+    '<div id="result"></div>' +
+    '</div>';
+  return { html: html, mount: function () {
+    mountScannerBox('cambox', onCode);
+    $('#manualform').onsubmit = function (e) { e.preventDefault(); onCode($('#manual').value); };
+    Array.prototype.forEach.call(document.querySelectorAll('.demochip'), function (c) {
+      c.onclick = function () { onCode(c.getAttribute('data-code')); };
+    });
+  }};
+
+  function onCode(code) {
+    var roll = rollByBarcode(code);
+    if (!roll) {
+      bad();
+      $('#result').innerHTML = '<div class="err center" style="font-size:1.3rem">&#10060; ROLL NOT FOUND<br><span style="font-size:1rem">"' +
+        esc(code) + '" is not in the system. Try again.</span></div>';
+      return;
+    }
+    good();
+    C.roll = roll;
+    $('#result').innerHTML =
+      '<div class="ok-panel"><div class="big-ok">&#9989; ROLL IDENTIFIED</div>' +
+      '<div class="kv"><span class="k">Roll #</span><span class="v mono">' + esc(roll.id) + '</span></div>' +
+      '<div class="kv"><span class="k">Style</span><span class="v">' + esc(roll.style) + '</span></div>' +
+      '<div class="kv"><span class="k">Color</span><span class="v">' + esc(roll.color) + '</span></div>' +
+      '<div class="kv"><span class="k">Current Balance</span><span class="v num" style="font-size:1.5rem">' + fmtLen(systemBalance(roll.id)) + '</span></div>' +
+      '</div>' +
+      '<button class="btn btn-primary btn-huge" id="cont">CONTINUE &rarr; ENTER CUT</button>';
+    $('#cont').onclick = function () { go('cut-entry'); };
+    $('#cont').scrollIntoView(false);
+  }
+};
+
+Screens['cut-entry'] = function () {
+  if (!C || !C.roll) { setTimeout(function () { go('cut-scan'); }, 0); return { html: '' }; }
+  var roll = C.roll, bal = systemBalance(roll.id);
+  var orderOpts = CutService.recentOrders().map(function (o) {
+    return '<option value="' + esc(o) + '">';
+  }).join('');
+  var html =
+    '<div class="screen">' +
+    '<div class="step-head">CUT TRANSACTION &mdash; ENTER CUT</div>' +
+    '<h1>Record a cut</h1>' +
+    '<div class="card">' +
+      '<div class="kv"><span class="k">Roll #</span><span class="v mono">' + esc(roll.id) + '</span></div>' +
+      '<div class="kv"><span class="k">Style</span><span class="v">' + esc(roll.style) + '</span></div>' +
+      '<div class="kv"><span class="k">Color</span><span class="v">' + esc(roll.color) + '</span></div>' +
+      '<div class="kv"><span class="k">Location</span><span class="v mono">' + esc(roll.expectedLocation) + '</span></div>' +
+      '<div class="kv"><span class="k">Current Balance' +
+        (isTestBalance(roll) ? ' <span class="stchip st-yellow">TEST</span>' : '') +
+        '</span><span class="v num" style="font-size:1.5rem">' + fmtLen(bal) + '</span></div>' +
+    '</div>' +
+    '<div class="field"><label class="label" for="order">ORDER NUMBER</label>' +
+      '<input class="input mono" id="order" list="orders" autocomplete="off" autocapitalize="characters" placeholder="e.g. XS024536">' +
+      '<datalist id="orders">' + orderOpts + '</datalist></div>' +
+    '<div class="field"><label class="label">CUT LENGTH</label></div>' +
+    '<div class="btn-row">' +
+      '<div class="field" style="flex:1"><label class="label">FEET</label>' +
+      '<input class="input num" id="cft" inputmode="numeric" autocomplete="off" placeholder="0"></div>' +
+      '<div class="field" style="flex:1"><label class="label">INCHES</label>' +
+      '<input class="input num" id="cin" inputmode="decimal" autocomplete="off" placeholder="0"></div>' +
+    '</div>' +
+    '<div class="card"><div class="kv"><span class="k">NEW EXPECTED BALANCE</span>' +
+      '<span class="v num" id="newbal" style="font-size:1.5rem">= ' + fmtLen(bal) + '</span></div></div>' +
+    '<div class="err" id="cuterr" hidden></div>' +
+    '<button class="btn btn-primary btn-huge" id="savecut">&#9986; SAVE CUT</button>' +
+    '<button class="btn" id="cutcancel">CANCEL</button>' +
+    '</div>';
+  return { html: html, mount: function () {
+    var update = function () {
+      var ft = parseFloat($('#cft').value) || 0, inch = parseFloat($('#cin').value) || 0;
+      if (ft < 0 || inch < 0 || isNaN(ft) || isNaN(inch)) { $('#newbal').textContent = '= —'; return; }
+      var cut = Math.round(ft * 12 + inch);
+      $('#newbal').textContent = '= ' + fmtLen(Math.max(0, bal - cut));
+      $('#newbal').style.color = cut > bal ? 'var(--red)' : '';
+    };
+    $('#cft').addEventListener('input', update);
+    $('#cin').addEventListener('input', update);
+    $('#cutcancel').onclick = function () { newCutSession(); go('home'); };
+    $('#savecut').onclick = function () {
+      var ft = $('#cft').value.trim(), inch = $('#cin').value.trim();
+      var cutIn = Math.round((parseFloat(ft || '0')) * 12 + parseFloat(inch || '0'));
+      var res = CutService.recordCut({
+        rollId: roll.id, order: $('#order').value,
+        cutIn: (ft === '' && inch === '') ? 0 : cutIn,
+        employee: DB.data.currentEmployee, location: roll.expectedLocation
+      });
+      if (!res.ok) { bad(); var e = $('#cuterr'); e.textContent = res.err; e.hidden = false; return; }
+      good();
+      go('cut-saved', res.rec.id);
+    };
+  }};
+};
+
+Screens['cut-saved'] = function (param) {
+  var rec = DB.data.cuts.filter(function (c) { return c.id === param; })[0];
+  if (!rec) { setTimeout(function () { go('home'); }, 0); return { html: '' }; }
+  var html =
+    '<div class="screen">' +
+    '<div class="ok-panel"><h1>&#9986; CUT SAVED</h1>' +
+    '<div class="kv"><span class="k">NEW EXPECTED BALANCE</span>' +
+    '<span class="v num" style="font-size:2rem">' + fmtLen(rec.newIn) + '</span></div></div>' +
+    '<div class="card">' +
+      '<div class="kv"><span class="k">Roll #</span><span class="v mono">' + esc(rec.rollId) + '</span></div>' +
+      '<div class="kv"><span class="k">Order</span><span class="v mono">' + esc(rec.order || '—') + '</span></div>' +
+      '<div class="kv"><span class="k">Previous Balance</span><span class="v num">' + fmtLen(rec.prevIn) + '</span></div>' +
+      '<div class="kv"><span class="k">Cut</span><span class="v num">' + fmtLen(rec.inches) + '</span></div>' +
+      '<div class="kv"><span class="k">New Balance</span><span class="v num">' + fmtLen(rec.newIn) + '</span></div>' +
+      '<div class="kv"><span class="k">By</span><span class="v">' + esc(rec.by) + ' &middot; ' + fmtDT(rec.at) + '</span></div>' +
+    '</div>' +
+    '<button class="btn btn-primary btn-huge" id="another">&#9986; CUT ANOTHER ROLL</button>' +
+    '<button class="btn btn-huge" id="done">DONE &rarr; HOME</button>' +
+    '</div>';
+  return { html: html, mount: function () {
+    $('#another').onclick = function () { newCutSession(); go('cut-scan'); };
+    $('#done').onclick = function () { newCutSession(); go('home'); };
+  }};
+};
 
 Screens.saved = function (param) {
   var rec = DB.data.counts.filter(function (c) { return c.id === (param || lastSavedId); })[0];
@@ -903,6 +1130,10 @@ Screens.roll = function (param) {
       '<div class="kv"><span class="k">Beginning Length</span><span class="v num">' + fmtLen(roll.beginningIn) + '</span></div>' +
       '<div class="kv"><span class="k">Current Balance</span><span class="v num">' + fmtLen(sys) + '</span></div>' +
       '<div class="kv"><span class="k">Current Location</span><span class="v mono">' + esc(roll.expectedLocation) + '</span></div>' +
+      (roll.measuredIn != null
+        ? '<div class="kv"><span class="k">Measured Balance <span class="stchip st-green">MB ✓</span></span><span class="v num">' + fmtLen(roll.measuredIn) + '</span></div>' +
+          '<div class="kv"><span class="k">Last Measured</span><span class="v">' + fmtDT(roll.measuredAt) + ' &middot; ' + esc(roll.measuredBy || '') + '</span></div>'
+        : '<div class="kv"><span class="k">Measured Balance</span><span class="v">Not measured yet</span></div>') +
     '</div>' +
     '<h2>History</h2>' +
     '<div class="ledger">' + ledgerHtml(roll) + '</div>' +
@@ -929,17 +1160,23 @@ function ledgerHtml(roll) {
   ev.forEach(function (e) {
     if (e.kind === 'cut') {
       bal -= e.inches;
+      var newBal = (e.newIn != null) ? e.newIn : bal;
+      var orderTag = e.order ? ' <span class="mono">Order ' + esc(e.order) + '</span>' : '';
       out += '<div class="ledger-row"><span class="dot" style="background:var(--blue)"></span>' +
-        '<div class="what"><b>Cut</b> <span class="num">' + fmtLen(e.inches) + '</span>' +
+        '<div class="what"><b>Cut</b> <span class="num">' + fmtLen(e.inches) + '</span>' + orderTag +
         '<div class="sub">' + fmtDT(e.at) + ' &middot; ' + esc(e.by) + '</div></div>' +
-        '<div class="bal"><div class="sub">New Balance</div><span class="num">' + fmtLen(bal) + '</span></div></div>';
+        '<div class="bal"><div class="sub">New Balance</div><span class="num">' + fmtLen(newBal) + '</span></div></div>';
     } else {
       var r = e.rec;
+      var phys = (r.physicalIn == null) ? '—' : fmtLen(r.physicalIn);
+      var ddiff = (r.diffIn == null) ? '—' : fmtDiff(r.diffIn);
+      var dcls = (r.diffIn == null) ? '' : diffCls(r.diffIn);
+      var mb = r.measured ? ' <span class="stchip st-green">MB ✓</span>' : '';
       out += '<div class="ledger-row"><span class="dot" style="background:' +
         (r.status === 'MATCH' ? 'var(--green)' : r.status === 'NEEDS_REVIEW' ? 'var(--yellow)' : 'var(--red)') + '"></span>' +
-        '<div class="what"><b>Physical Cycle Count</b> <span class="num">' + fmtLen(r.physicalIn) + '</span> ' + statusChip(r.status) +
+        '<div class="what"><b>Physical Cycle Count</b> <span class="num">' + phys + '</span> ' + statusChip(r.status) + mb +
         '<div class="sub">' + fmtDT(r.at) + ' &middot; ' + esc(r.employee) + ' &middot; loc <span class="mono">' + esc(r.scannedLocation) + '</span></div></div>' +
-        '<div class="bal"><div class="sub">Difference</div><span class="' + diffCls(r.diffIn) + ' num">' + fmtDiff(r.diffIn) + '</span></div></div>';
+        '<div class="bal"><div class="sub">Difference</div><span class="' + dcls + ' num">' + ddiff + '</span></div></div>';
     }
   });
   return out;
@@ -960,11 +1197,15 @@ Screens.recent = function () {
 function countRow(c) {
   var date = c.date || new Date(c.at).toLocaleDateString();
   var time = c.time || fmtTime(c.at);
+  var mb = c.measured ? ' <span class="stchip st-green">MB ✓</span>' : '';
+  var balLine = (c.physicalIn == null)
+    ? '<div class="sub">mismatch flagged — not measured</div>'
+    : '<div class="sub num">Sys <b>' + fmtLen(c.expectedIn) + '</b> &middot; Phys <b>' + fmtLen(c.physicalIn) + '</b>' +
+      ' &middot; Diff <b class="' + diffCls(c.diffIn) + '">' + fmtDiff(c.diffIn) + '</b></div>';
   return '<button class="rowbtn" data-count="' + esc(c.id) + '">' +
-    '<div class="rhead"><b class="mono">' + esc(c.rollId) + '</b>' + statusChip(c.status) + '</div>' +
+    '<div class="rhead"><b class="mono">' + esc(c.rollId) + '</b>' + statusChip(c.status) + mb + '</div>' +
     '<div class="sub"><b>' + esc(time) + '</b> &middot; loc <b class="mono">' + esc(c.scannedLocation) + '</b></div>' +
-    '<div class="sub num">Sys <b>' + fmtLen(c.expectedIn) + '</b> &middot; Phys <b>' + fmtLen(c.physicalIn) + '</b>' +
-    ' &middot; Diff <b class="' + diffCls(c.diffIn) + '">' + fmtDiff(c.diffIn) + '</b></div>' +
+    balLine +
     '<div class="sub">' + esc(date) + ' &middot; ' + esc(c.employee) + '</div></button>';
 }
 function wireCountRows() {
@@ -995,8 +1236,10 @@ Screens.count = function (param) {
       '<div class="kv"><span class="k">Expected Location</span><span class="v mono">' + esc(c.expectedLocation) + '</span></div>' +
       '<div class="kv"><span class="k">Scanned Location</span><span class="v mono">' + esc(c.scannedLocation) + '</span></div>' +
       '<div class="kv"><span class="k">Expected Balance</span><span class="v num">' + fmtLen(c.expectedIn) + '</span></div>' +
-      '<div class="kv"><span class="k">Physical Balance</span><span class="v num">' + fmtLen(c.physicalIn) + '</span></div>' +
-      '<div class="kv"><span class="k">Difference</span><span class="v ' + diffCls(c.diffIn) + ' num">' + fmtDiff(c.diffIn) + '</span></div>' +
+      '<div class="kv"><span class="k">Physical Balance' + (c.measured ? ' <span class="stchip st-green">MB ✓</span>' : '') + '</span><span class="v num">' +
+        (c.physicalIn == null ? '— (not measured)' : fmtLen(c.physicalIn)) + '</span></div>' +
+      '<div class="kv"><span class="k">Difference</span><span class="v ' + (c.diffIn == null ? '' : diffCls(c.diffIn)) + ' num">' +
+        (c.diffIn == null ? '—' : fmtDiff(c.diffIn)) + '</span></div>' +
       '<div class="kv"><span class="k">Employee</span><span class="v">' + esc(c.employee) + '</span></div>' +
       '<div class="kv"><span class="k">Date</span><span class="v">' + esc(date) + '</span></div>' +
       '<div class="kv"><span class="k">Time</span><span class="v">' + esc(time) + '</span></div>' +
@@ -1080,6 +1323,214 @@ Screens.testbaledit = function (param) {
   }};
 };
 
+/* ---------------- RAPID CYCLE COUNT ----------------------------------------------
+   Built for walking the rows: SCAN LOCATION once, then SCAN -> TYPE BALANCE ->
+   SAVE & NEXT -> SCAN ... The worker never returns to home between rolls.
+   The active location is remembered for the whole session; a roll whose
+   expected location differs raises LOCATION MISMATCH immediately.
+   Scanner implementation untouched — shared mountScannerBox wiring reused. */
+Screens['rapid-loc'] = function () {
+  if (!R) newRapid();
+  var chips = ['205A', '205B', '206A', '206B', '204A', '204B'].map(function (l) {
+    return '<button class="demochip" data-code="' + esc(l) + '">' + esc(l) + '</button>';
+  }).join('');
+  var html =
+    '<div class="screen">' +
+    '<div class="step-head">RAPID CYCLE COUNT &mdash; STEP 1</div>' +
+    '<h1>Scan location</h1>' +
+    '<p class="hint">Scan the rack location tag. Every roll you scan after this is counted at that location until you change it.</p>' +
+    '<div class="cambox" id="cambox"><div class="camnote">Starting camera&hellip;</div></div>' +
+    '<form id="manualform"><div class="field">' +
+      '<label class="label" for="manual">OR TYPE / WEDGE THE LOCATION CODE</label>' +
+      '<input class="input mono" id="manual" autocomplete="off" autocapitalize="characters" placeholder="e.g. 205B">' +
+    '</div>' +
+    '<button class="btn btn-primary btn-huge" type="submit">ENTER CODE</button></form>' +
+    '<div class="demolabel">DEMO &mdash; TAP TO SIMULATE A SCAN</div>' +
+    '<div class="demochips">' + chips + '</div>' +
+    '<div id="result"></div>' +
+    '</div>';
+  return { html: html, mount: function () {
+    mountScannerBox('cambox', onCode);
+    $('#manualform').onsubmit = function (e) { e.preventDefault(); onCode($('#manual').value); };
+    Array.prototype.forEach.call(document.querySelectorAll('.demochip'), function (c) {
+      c.onclick = function () { onCode(c.getAttribute('data-code')); };
+    });
+  }};
+  function onCode(code) {
+    var loc = normLoc(code);
+    if (!loc) {
+      bad();
+      $('#result').innerHTML = '<div class="err center" style="font-size:1.3rem">&#10060; EMPTY SCAN &mdash; try again.</div>';
+      return;
+    }
+    good();
+    R.activeLoc = loc;
+    R.lastMsg = null;
+    go('rapid-scan');
+  }
+};
+
+function rapidBanner() {
+  var m = R && R.lastMsg;
+  if (!m) return '';
+  var color = { MATCH: 'var(--green)', SHORT: 'var(--red)', OVER: 'var(--yellow)',
+                LOCATION_MISMATCH: 'var(--red)', NEEDS_REVIEW: 'var(--yellow)' }[m.status] || 'var(--yellow)';
+  return '<div class="card" style="border:2px solid ' + color + ';text-align:center">' +
+    '<div style="font-size:1.4rem;font-weight:900;color:' + color + '">' + esc(m.text) + '</div></div>';
+}
+
+Screens['rapid-scan'] = function () {
+  if (!R || !R.activeLoc) { setTimeout(function () { go('rapid-loc'); }, 0); return { html: '' }; }
+  var chips = DB.data.rolls.map(function (r) {
+    return '<button class="demochip" data-code="' + esc(r.barcode) + '">' + esc(r.barcode) + '</button>';
+  }).join('');
+  var html =
+    '<div class="screen">' +
+    '<div class="step-head">RAPID CYCLE COUNT</div>' +
+    '<div class="card" style="text-align:center">' +
+      '<div class="label">COUNTING LOCATION</div>' +
+      '<div class="mono" style="font-size:2.4rem;font-weight:900">' + esc(R.activeLoc) + '</div>' +
+    '</div>' +
+    rapidBanner() +
+    '<h1>Scan roll</h1>' +
+    '<div class="cambox" id="cambox"><div class="camnote">Starting camera&hellip;</div></div>' +
+    '<form id="manualform"><div class="field">' +
+      '<label class="label" for="manual">OR TYPE / WEDGE THE BARCODE</label>' +
+      '<input class="input mono" id="manual" autocomplete="off" autocapitalize="characters" placeholder="e.g. QH5CPHN">' +
+    '</div>' +
+    '<button class="btn btn-primary btn-huge" type="submit">ENTER CODE</button></form>' +
+    '<div class="demolabel">DEMO &mdash; TAP TO SIMULATE A SCAN</div>' +
+    '<div class="demochips">' + chips + '</div>' +
+    '<div id="result"></div>' +
+    '<div class="btn-row">' +
+      '<button class="btn" id="changeloc" style="flex:1">&#8646; CHANGE LOCATION</button>' +
+      '<button class="btn" id="rapiddone" style="flex:1">DONE</button>' +
+    '</div>' +
+    '</div>';
+  return { html: html, mount: function () {
+    mountScannerBox('cambox', onCode);
+    $('#manualform').onsubmit = function (e) { e.preventDefault(); onCode($('#manual').value); };
+    Array.prototype.forEach.call(document.querySelectorAll('.demochip'), function (c) {
+      c.onclick = function () { onCode(c.getAttribute('data-code')); };
+    });
+    $('#changeloc').onclick = function () { go('rapid-loc'); };
+    $('#rapiddone').onclick = function () { R = null; go('home'); };
+  }};
+  function onCode(code) {
+    var roll = rollByBarcode(code);
+    if (!roll) {
+      bad();
+      $('#result').innerHTML = '<div class="err center" style="font-size:1.3rem">&#10060; ROLL NOT FOUND<br><span style="font-size:1rem">"' +
+        esc(code) + '" is not in the system. Try again.</span></div>';
+      return;
+    }
+    good();
+    R.scan = { roll: roll };
+    if (normLoc(roll.expectedLocation) !== normLoc(R.activeLoc)) go('rapid-mismatch');
+    else go('rapid-balance');
+  }
+};
+
+Screens['rapid-mismatch'] = function () {
+  if (!R || !R.scan || !R.scan.roll) { setTimeout(function () { go('rapid-scan'); }, 0); return { html: '' }; }
+  var roll = R.scan.roll;
+  var html =
+    '<div class="screen">' +
+    '<div class="warn-panel"><h1>&#9888; LOCATION MISMATCH</h1>' +
+    '<div class="vs"><div><div class="k">EXPECTED</div><div class="v mono">' + esc(roll.expectedLocation) + '</div></div>' +
+    '<div><div class="k">COUNT LOCATION</div><div class="v mono">' + esc(R.activeLoc) + '</div></div></div></div>' +
+    '<div class="card">' +
+      '<div class="kv"><span class="k">Roll #</span><span class="v mono">' + esc(roll.id) + '</span></div>' +
+      '<div class="kv"><span class="k">Style</span><span class="v">' + esc(roll.style) + '</span></div>' +
+      '<div class="kv"><span class="k">Color</span><span class="v">' + esc(roll.color) + '</span></div>' +
+    '</div>' +
+    '<p class="hint">This roll does not belong at <b class="mono">' + esc(R.activeLoc) + '</b>. Flag it for supervisor review, or cancel and keep counting.</p>' +
+    '<button class="btn btn-red btn-huge" id="flag">&#9888; FLAG FOR REVIEW</button>' +
+    '<button class="btn btn-huge" id="cancel">CANCEL &rarr; KEEP COUNTING</button>' +
+    '</div>';
+  return { html: html, mount: function () {
+    $('#flag').onclick = function () {
+      var now = new Date();
+      DB.data.counts.push({
+        id: 'C' + Date.now().toString(36).toUpperCase(),
+        rollId: roll.id, barcode: roll.barcode, style: roll.style, color: roll.color, widthIn: roll.widthIn,
+        expectedLocation: roll.expectedLocation, scannedLocation: R.activeLoc,
+        expectedIn: systemBalance(roll.id), physicalIn: null, diffIn: null,
+        measured: false, /* no physical measurement taken — mismatch flagged only */
+        employee: DB.data.currentEmployee, at: now.toISOString(),
+        date: now.toLocaleDateString(), time: fmtTime(now.toISOString()),
+        status: 'LOCATION_MISMATCH', flagged: true
+      });
+      DB.save();
+      bad();
+      R.lastMsg = { status: 'LOCATION_MISMATCH', text: '⚠ MISMATCH — ' + roll.id + ' flagged for review' };
+      R.scan = null;
+      go('rapid-scan');
+    };
+    $('#cancel').onclick = function () { R.scan = null; go('rapid-scan'); };
+  }};
+};
+
+Screens['rapid-balance'] = function () {
+  if (!R || !R.scan || !R.scan.roll) { setTimeout(function () { go('rapid-scan'); }, 0); return { html: '' }; }
+  var roll = R.scan.roll, sys = systemBalance(roll.id);
+  var html =
+    '<div class="screen">' +
+    '<div class="step-head">RAPID CYCLE COUNT &mdash; ' + esc(R.activeLoc) + '</div>' +
+    '<div class="card">' +
+      '<div class="kv"><span class="k">Roll #</span><span class="v mono">' + esc(roll.id) + '</span></div>' +
+      '<div class="kv"><span class="k">Style</span><span class="v">' + esc(roll.style) + '</span></div>' +
+      '<div class="kv"><span class="k">Color</span><span class="v">' + esc(roll.color) + '</span></div>' +
+      '<div class="kv"><span class="k">Location</span><span class="v mono">' + esc(R.activeLoc) + '</span></div>' +
+      '<div class="kv"><span class="k">EXPECTED BALANCE' +
+        (isTestBalance(roll) ? ' <span class="stchip st-yellow">TEST</span>' : '') +
+        '</span><span class="v num" style="font-size:2rem">' + fmtLen(sys) + '</span></div>' +
+    '</div>' +
+    '<div class="btn-row">' +
+      '<div class="field" style="flex:1"><label class="label">FEET</label>' +
+      '<input class="input num" id="rft" inputmode="numeric" autocomplete="off" placeholder="0" style="font-size:2.2rem;min-height:84px;text-align:center"></div>' +
+      '<div class="field" style="flex:1"><label class="label">INCHES</label>' +
+      '<input class="input num" id="rin" inputmode="decimal" autocomplete="off" placeholder="0" style="font-size:2.2rem;min-height:84px;text-align:center"></div>' +
+    '</div>' +
+    '<div class="err" id="rerr" hidden></div>' +
+    '<button class="btn btn-primary btn-huge" id="savenext">&#10003; SAVE &amp; NEXT</button>' +
+    '<button class="btn" id="rback">&larr; BACK TO SCANNER</button>' +
+    '</div>';
+  return { html: html, mount: function () {
+    $('#rback').onclick = function () { R.scan = null; go('rapid-scan'); };
+    $('#savenext').onclick = function () {
+      var ft = parseFloat($('#rft').value), inch = parseFloat($('#rin').value);
+      var err = '';
+      if ($('#rft').value.trim() === '' && $('#rin').value.trim() === '') err = 'Enter feet and/or inches.';
+      else if (isNaN(ft) || isNaN(inch) || ft < 0 || inch < 0) err = 'Numbers must be zero or more.';
+      if (err) { bad(); var e = $('#rerr'); e.textContent = err; e.hidden = false; return; }
+      var physicalIn = Math.round(ft * 12 + inch);
+      var diff = physicalIn - sys;
+      var status = computeStatus(roll, R.activeLoc, physicalIn, false);
+      var now = new Date();
+      DB.data.counts.push({
+        id: 'C' + Date.now().toString(36).toUpperCase(),
+        rollId: roll.id, barcode: roll.barcode, style: roll.style, color: roll.color, widthIn: roll.widthIn,
+        expectedLocation: roll.expectedLocation, scannedLocation: R.activeLoc,
+        expectedIn: sys, physicalIn: physicalIn, diffIn: diff,
+        measured: true, /* MB: worker physically measured this roll */
+        employee: DB.data.currentEmployee, at: now.toISOString(),
+        date: now.toLocaleDateString(), time: fmtTime(now.toISOString()),
+        status: status, flagged: false
+      });
+      roll.measuredIn = physicalIn;
+      roll.measuredAt = now.toISOString();
+      roll.measuredBy = DB.data.currentEmployee;
+      DB.save();
+      if (status === 'MATCH') good(); else bad();
+      var sym = status === 'MATCH' ? '✓' : (status === 'SHORT' ? '▼' : '▲');
+      R.lastMsg = { status: status, text: sym + ' ' + status + ' ' + fmtDiff(diff) + ' — ' + roll.id };
+      R.scan = null;
+      go('rapid-scan'); /* straight back to the scanner — never home */
+    };
+  }};
+};
+
 /* ---------------- SUPERVISOR DASHBOARD ------------------------------------------- */
 Screens.dashboard = function () {
   var today = DB.data.counts.filter(function (c) { return isToday(c.at); });
@@ -1115,6 +1566,8 @@ Screens.dashboard = function () {
       '<div class="metric"><div class="n" style="font-size:1.2rem">' + (last ? fmtTime(last.at) : '&mdash;') + '</div><div class="l">LAST COUNT TIME</div></div>' +
     '</div>' +
     '<h2>Counts by employee</h2><div class="card">' + empRows + '</div>' +
+    '<button class="btn btn-huge" id="godisc">&#9888; CYCLE COUNT DISCREPANCIES' +
+    (n('SHORT') + n('OVER') ? ' (' + (n('SHORT') + n('OVER')) + ' today)' : '') + '</button>' +
     '<h2>Search &amp; filter</h2>' +
     '<div class="field"><input class="input" id="dq" autocomplete="off" placeholder="Roll, location, style, color, employee, date&hellip;"></div>' +
     '<div class="chiprow" id="dchips"><button class="fchip on" data-f="">ALL</button>' + chips + '</div>' +
@@ -1123,7 +1576,7 @@ Screens.dashboard = function () {
     '<div class="card">' +
       '<button class="btn btn-huge" id="gotestbal">&#9874; SET TEST SYSTEM BALANCE</button>' +
       '<button class="btn btn-red btn-huge" id="resetcounts">RESET TEST DATA</button>' +
-      '<p class="hint">Reset test data clears <b>cycle counts only</b> &mdash; rolls, cuts, test balances, and the barcode scanner are untouched.</p>' +
+      '<p class="hint">Reset test data clears <b>cycle counts and measured-balance (MB) markers</b> &mdash; rolls, cuts, test balances, and the barcode scanner are untouched.</p>' +
     '</div>' +
     '<div class="foot"><button class="linklike" id="resetdemo">Reset demo data</button></div>' +
     '</div>';
@@ -1154,11 +1607,13 @@ Screens.dashboard = function () {
       if (confirm('Reset all demo data to the seeded sample?')) { DB.reset(); good(); render(); }
     };
     $('#gotestbal').onclick = function () { go('testbal'); };
+    $('#godisc').onclick = function () { go('discrepancies'); };
     $('#resetcounts').onclick = function () {
       var n = DB.data.counts.length;
       if (n === 0) { alert('No cycle counts to clear.'); return; }
-      if (confirm('RESET TEST DATA?\n\nThis clears ' + n + ' saved cycle count' + (n === 1 ? '' : 's') + '.\n\nRoll data, cuts, test system balances, and the barcode scanner are NOT affected.\nThis cannot be undone.')) {
+      if (confirm('RESET TEST DATA?\n\nThis clears ' + n + ' saved cycle count' + (n === 1 ? '' : 's') + ' and all measured-balance (MB) markers.\n\nRoll data, cuts, test system balances, and the barcode scanner are NOT affected.\nThis cannot be undone.')) {
         DB.data.counts = [];
+        DB.data.rolls.forEach(function (r) { r.measuredIn = null; r.measuredAt = null; r.measuredBy = null; });
         DB.save();
         good(); render();
       }
@@ -1168,6 +1623,38 @@ Screens.dashboard = function () {
   function metric(num, label, cls) {
     return '<div class="metric ' + (cls || '') + '"><div class="n num">' + num + '</div><div class="l">' + label + '</div></div>';
   }
+};
+
+/* ---------------- CYCLE COUNT DISCREPANCIES (supervisor) ---------------------------
+   Shows only rolls whose latest physically-measured balance differs from the
+   expected balance. Discrepancies are recorded for review — reviewing never
+   changes the expected balance; that only happens through cut transactions. */
+Screens.discrepancies = function () {
+  var latest = {};
+  DB.data.counts.forEach(function (c) {
+    /* latest measured count per roll (skip mismatch-only flags with no measurement) */
+    if (!c.measured || c.physicalIn == null) return;
+    if (!latest[c.rollId] || new Date(c.at) > new Date(latest[c.rollId].at)) latest[c.rollId] = c;
+  });
+  var rows = Object.keys(latest).map(function (k) { return latest[k]; })
+    .filter(function (c) { return c.diffIn !== 0; })
+    .sort(function (a, b) { return new Date(b.at) - new Date(a.at); });
+  var html =
+    '<div class="screen">' +
+    '<div class="step-head">SUPERVISOR</div>' +
+    '<h1>Cycle count discrepancies</h1>' +
+    '<p class="hint">Rolls where the last <b>measured</b> balance (MB ✓) differs from the expected balance. ' +
+    'Review only &mdash; expected balances change through cut transactions, never here.</p>' +
+    (rows.length ? rows.map(function (c) {
+      return '<button class="rowbtn" data-count="' + esc(c.id) + '">' +
+        '<div class="rhead"><b class="mono">' + esc(c.rollId) + '</b>' + statusChip(c.status) +
+        ' <span class="stchip st-green">MB ✓</span></div>' +
+        '<div class="sub">loc <b class="mono">' + esc(c.scannedLocation) + '</b> &middot; ' + esc(c.employee) + ' &middot; ' + esc(c.time || fmtTime(c.at)) + '</div>' +
+        '<div class="sub num">Exp <b>' + fmtLen(c.expectedIn) + '</b> &middot; Meas <b>' + fmtLen(c.physicalIn) + '</b>' +
+        ' &middot; Diff <b class="' + diffCls(c.diffIn) + '">' + fmtDiff(c.diffIn) + '</b></div></button>';
+    }).join('') : '<p class="hint center">No discrepancies &mdash; every measured roll matches.</p>') +
+    '</div>';
+  return { html: html, mount: function () { wireCountRows(); } };
 };
 
 /* ---------------- boot ---------------------------------------------------------- */
