@@ -166,14 +166,22 @@ function rollByBarcode(code) {
   return null;
 }
 /* System balance = beginning length minus all recorded cuts.
-   Cycle counts never change it. */
+   Cycle counts never change it.
+   --- TEMPORARY PILOT FUNCTIONALITY ---
+   A supervisor can set roll.testBalanceIn via "SET TEST SYSTEM BALANCE" to stand
+   in for the Real Floors system balance during the warehouse pilot. When set,
+   it is returned instead of the computed value. To integrate the Real Floors
+   API/database later: delete testBalanceIn and have systemBalance() fetch the
+   authoritative balance from the backend instead. */
 function systemBalance(rollId) {
   var roll = rollById(rollId);
   if (!roll) return 0;
+  if (roll.testBalanceIn != null) return roll.testBalanceIn; /* TEMPORARY PILOT: Real Floors API replaces this */
   var cuts = DB.data.cuts.filter(function (c) { return c.rollId === rollId; });
   var used = cuts.reduce(function (s, c) { return s + c.inches; }, 0);
   return roll.beginningIn - used;
 }
+function isTestBalance(roll) { return !!(roll && roll.testBalanceIn != null); }
 function countsForRoll(rollId) {
   return DB.data.counts
     .filter(function (c) { return c.rollId === rollId; })
@@ -227,7 +235,7 @@ function isToday(iso) {
 var STATUS = {
   MATCH:            { label: 'MATCH',            chip: 'st-green'  },
   SHORT:            { label: 'SHORT',            chip: 'st-red'    },
-  OVER:             { label: 'OVER',             chip: 'st-blue'   },
+  OVER:             { label: 'OVER',             chip: 'st-yellow' },
   LOCATION_MISMATCH:{ label: 'LOCATION MISMATCH',chip: 'st-red'    },
   NEEDS_REVIEW:     { label: 'NEEDS REVIEW',     chip: 'st-yellow' }
 };
@@ -433,7 +441,8 @@ var TITLES = {
   dup: 'Duplicate Check', balance: 'Enter Balance', confirm: 'Confirm Count',
   mismatch: 'Location Mismatch', saved: 'Count Saved', search: 'Search Roll',
   roll: 'Roll History', recent: 'Recent Counts', count: 'Count Detail',
-  dashboard: 'Supervisor Dashboard', employee: 'Who Is Counting?'
+  dashboard: 'Supervisor Dashboard', employee: 'Who Is Counting?',
+  testbal: 'Set Test Balance', testbaledit: 'Edit Test Balance'
 };
 
 function render() {
@@ -718,56 +727,46 @@ Screens.dup = function () {
 /* ---------------- ENTER PHYSICAL BALANCE (step 3) ------------------------------ */
 Screens.balance = function () {
   if (!needLoc()) return { html: '' };
+  var roll = S.roll, sys = systemBalance(roll.id);
   var html =
     '<div class="screen">' +
-    '<div class="step-head">STEP 3 OF 4 &mdash; ENTER PHYSICAL BALANCE</div>' +
-    '<h1>Measure the roll</h1>' +
-    '<p class="hint">Roll <b class="mono">' + esc(S.roll.id) + '</b> &mdash; enter the <b>physical</b> remaining balance.</p>' +
-    '<div class="seg" id="seg">' +
-      '<button class="btn on" data-mode="fti">FEET + INCHES</button>' +
-      '<button class="btn" data-mode="dec">DECIMAL FEET</button>' +
+    '<div class="step-head">STEP 3 OF 4 &mdash; PHYSICAL BALANCE</div>' +
+    '<h1>Physical balance</h1>' +
+    '<div class="card">' +
+      '<div class="kv"><span class="k">Roll #</span><span class="v mono">' + esc(roll.id) + '</span></div>' +
+      '<div class="kv"><span class="k">Style</span><span class="v">' + esc(roll.style) + '</span></div>' +
+      '<div class="kv"><span class="k">Color</span><span class="v">' + esc(roll.color) + '</span></div>' +
+      '<div class="kv"><span class="k">Location</span><span class="v mono">' + esc(normLoc(S.scannedLoc)) + '</span></div>' +
+      '<div class="kv"><span class="k">System Balance' +
+        (isTestBalance(roll) ? ' <span class="stchip st-yellow">TEST</span>' : '') +
+        '</span><span class="v num" style="font-size:1.5rem">' + fmtLen(sys) + '</span></div>' +
     '</div>' +
-    '<div id="fti-fields">' +
-      '<div class="btn-row">' +
-        '<div class="field" style="flex:1"><label class="label">FEET</label>' +
-        '<input class="input num" id="ft" inputmode="numeric" autocomplete="off" placeholder="0"></div>' +
-        '<div class="field" style="flex:1"><label class="label">INCHES</label>' +
-        '<input class="input num" id="inch" inputmode="decimal" autocomplete="off" placeholder="0"></div>' +
-      '</div>' +
+    '<div class="field"><label class="label">AMOUNT OF CARPET PHYSICALLY ON THE ROLL</label></div>' +
+    '<div class="btn-row">' +
+      '<div class="field" style="flex:1"><label class="label">FEET</label>' +
+      '<input class="input num balfield" id="ft" inputmode="numeric" autocomplete="off" placeholder="0"></div>' +
+      '<div class="field" style="flex:1"><label class="label">INCHES</label>' +
+      '<input class="input num balfield" id="inch" inputmode="decimal" autocomplete="off" placeholder="0"></div>' +
     '</div>' +
-    '<div id="dec-fields" hidden>' +
-      '<div class="field"><label class="label">LINEAR FEET (DECIMAL)</label>' +
-      '<input class="input num" id="decft" inputmode="decimal" autocomplete="off" placeholder="e.g. 44.4"></div>' +
-    '</div>' +
+    '<div class="big-readout num" id="combined">= 0\' 0"</div>' +
     '<div class="err" id="balerr" hidden></div>' +
     '<button class="btn btn-primary btn-huge" id="cont">CONTINUE &rarr; REVIEW</button>' +
     '</div>';
   return { html: html, mount: function () {
-    var mode = 'fti';
-    Array.prototype.forEach.call(document.querySelectorAll('#seg .btn'), function (b) {
-      b.onclick = function () {
-        mode = b.getAttribute('data-mode');
-        Array.prototype.forEach.call(document.querySelectorAll('#seg .btn'), function (x) {
-          x.classList.toggle('on', x === b);
-        });
-        $('#fti-fields').hidden = mode !== 'fti';
-        $('#dec-fields').hidden = mode !== 'dec';
-      };
-    });
+    var update = function () {
+      var ft = parseFloat($('#ft').value) || 0, inch = parseFloat($('#inch').value) || 0;
+      if (ft < 0 || inch < 0 || isNaN(ft) || isNaN(inch)) { $('#combined').textContent = '= —'; return; }
+      $('#combined').textContent = '= ' + fmtLen(Math.round(ft * 12 + inch));
+    };
+    $('#ft').addEventListener('input', update);
+    $('#inch').addEventListener('input', update);
     $('#cont').onclick = function () {
-      var total = null, err = '';
-      if (mode === 'fti') {
-        var ft = parseFloat($('#ft').value), inch = parseFloat($('#inch').value);
-        if ($('#ft').value.trim() === '' && $('#inch').value.trim() === '') err = 'Enter feet and/or inches.';
-        else if (isNaN(ft) || isNaN(inch) || ft < 0 || inch < 0) err = 'Numbers must be zero or more.';
-        else total = Math.round(ft * 12 + inch);
-      } else {
-        var v = parseFloat($('#decft').value);
-        if ($('#decft').value.trim() === '' || isNaN(v) || v < 0) err = 'Enter decimal feet (0 or more).';
-        else total = Math.round(v * 12);
-      }
+      var ft = parseFloat($('#ft').value), inch = parseFloat($('#inch').value);
+      var err = '';
+      if ($('#ft').value.trim() === '' && $('#inch').value.trim() === '') err = 'Enter feet and/or inches.';
+      else if (isNaN(ft) || isNaN(inch) || ft < 0 || inch < 0) err = 'Numbers must be zero or more.';
       if (err) { bad(); var e = $('#balerr'); e.textContent = err; e.hidden = false; return; }
-      S.physicalIn = total;
+      S.physicalIn = Math.round(ft * 12 + inch);
       good();
       go(normLoc(S.scannedLoc) !== normLoc(S.roll.expectedLocation) ? 'mismatch' : 'confirm');
     };
@@ -841,12 +840,14 @@ function submitCount(flagged) {
   var sys = systemBalance(roll.id);
   var diff = S.physicalIn - sys;
   var status = computeStatus(roll, S.scannedLoc, S.physicalIn, flagged);
+  var now = new Date();
   var rec = {
     id: 'C' + Date.now().toString(36).toUpperCase(),
-    rollId: roll.id, style: roll.style, color: roll.color, widthIn: roll.widthIn,
+    rollId: roll.id, barcode: roll.barcode, style: roll.style, color: roll.color, widthIn: roll.widthIn,
     expectedLocation: roll.expectedLocation, scannedLocation: S.scannedLoc,
     expectedIn: sys, physicalIn: S.physicalIn, diffIn: diff,
-    employee: DB.data.currentEmployee, at: new Date().toISOString(),
+    employee: DB.data.currentEmployee, at: now.toISOString(),
+    date: now.toLocaleDateString(), time: fmtTime(now.toISOString()),
     status: status, flagged: !!flagged
   };
   DB.data.counts.push(rec); /* append-only: records are never edited or deleted */
@@ -860,14 +861,20 @@ function submitCount(flagged) {
 Screens.saved = function (param) {
   var rec = DB.data.counts.filter(function (c) { return c.id === (param || lastSavedId); })[0];
   if (!rec) { setTimeout(function () { go('home'); }, 0); return { html: '' }; }
+  var panel = { MATCH: 'ok-panel', SHORT: 'warn-panel', OVER: 'over-panel',
+                LOCATION_MISMATCH: 'warn-panel', NEEDS_REVIEW: 'over-panel' }[rec.status] || 'over-panel';
+  var statusColor = { MATCH: 'var(--green)', SHORT: 'var(--red)', OVER: 'var(--yellow)',
+                      LOCATION_MISMATCH: 'var(--red)', NEEDS_REVIEW: 'var(--yellow)' }[rec.status] || 'var(--yellow)';
   var html =
     '<div class="screen">' +
-    '<div class="ok-panel"><h1>&#9989;<br>CYCLE COUNT SAVED</h1>' +
-    '<div style="margin:10px 0">' + statusChip(rec.status) + '</div></div>' +
+    '<div class="' + panel + '"><h1>CYCLE COUNT RESULT</h1>' +
+    '<div class="result-status" style="color:' + statusColor + '">' + STATUS[rec.status].label + '</div></div>' +
     '<div class="card">' +
-      '<div class="kv"><span class="k">Roll #</span><span class="v mono">' + esc(rec.rollId) + '</span></div>' +
-      '<div class="kv"><span class="k">Location scanned</span><span class="v mono">' + esc(rec.scannedLocation) + '</span></div>' +
-      '<div class="kv"><span class="k">Difference</span><span class="v ' + diffCls(rec.diffIn) + ' num">' + fmtDiff(rec.diffIn) + '</span></div>' +
+      '<div class="kv"><span class="k">Roll</span><span class="v mono result-num">' + esc(rec.rollId) + '</span></div>' +
+      '<div class="kv"><span class="k">Location</span><span class="v mono result-num">' + esc(rec.scannedLocation) + '</span></div>' +
+      '<div class="kv"><span class="k">System Balance</span><span class="v num result-num">' + fmtLen(rec.expectedIn) + '</span></div>' +
+      '<div class="kv"><span class="k">Physical Balance</span><span class="v num result-num">' + fmtLen(rec.physicalIn) + '</span></div>' +
+      '<div class="kv"><span class="k">Difference</span><span class="v ' + diffCls(rec.diffIn) + ' num result-num">' + fmtDiff(rec.diffIn) + '</span></div>' +
       '<div class="kv"><span class="k">By</span><span class="v">' + esc(rec.employee) + ' &middot; ' + fmtDT(rec.at) + '</span></div>' +
     '</div>' +
     '<button class="btn btn-primary btn-huge" id="another">&#9654; COUNT ANOTHER ROLL</button>' +
@@ -951,10 +958,14 @@ Screens.recent = function () {
 };
 
 function countRow(c) {
+  var date = c.date || new Date(c.at).toLocaleDateString();
+  var time = c.time || fmtTime(c.at);
   return '<button class="rowbtn" data-count="' + esc(c.id) + '">' +
     '<div class="rhead"><b class="mono">' + esc(c.rollId) + '</b>' + statusChip(c.status) + '</div>' +
-    '<div class="sub">' + esc(c.style) + ' &middot; ' + esc(c.employee) + ' &middot; ' + fmtDT(c.at) +
-    ' &middot; diff <b class="' + diffCls(c.diffIn) + ' num">' + fmtDiff(c.diffIn) + '</b></div></button>';
+    '<div class="sub"><b>' + esc(time) + '</b> &middot; loc <b class="mono">' + esc(c.scannedLocation) + '</b></div>' +
+    '<div class="sub num">Sys <b>' + fmtLen(c.expectedIn) + '</b> &middot; Phys <b>' + fmtLen(c.physicalIn) + '</b>' +
+    ' &middot; Diff <b class="' + diffCls(c.diffIn) + '">' + fmtDiff(c.diffIn) + '</b></div>' +
+    '<div class="sub">' + esc(date) + ' &middot; ' + esc(c.employee) + '</div></button>';
 }
 function wireCountRows() {
   Array.prototype.forEach.call(document.querySelectorAll('[data-count]'), function (b) {
@@ -965,6 +976,10 @@ function wireCountRows() {
 Screens.count = function (param) {
   var c = DB.data.counts.filter(function (x) { return x.id === param; })[0];
   if (!c) { setTimeout(function () { go('recent'); }, 0); return { html: '' }; }
+  var roll = rollById(c.rollId);
+  var barcode = c.barcode || (roll ? roll.barcode : c.rollId);
+  var date = c.date || new Date(c.at).toLocaleDateString();
+  var time = c.time || fmtTime(c.at);
   var html =
     '<div class="screen">' +
     '<div class="step-head">COUNT DETAIL</div>' +
@@ -972,6 +987,7 @@ Screens.count = function (param) {
     '<div style="margin-bottom:8px">' + statusChip(c.status) + '</div>' +
     '<div class="card">' +
       '<div class="kv"><span class="k">Roll Number</span><span class="v mono">' + esc(c.rollId) + '</span></div>' +
+      '<div class="kv"><span class="k">Roll Barcode</span><span class="v mono">' + esc(barcode) + '</span></div>' +
       '<div class="kv"><span class="k">Product / Style</span><span class="v">' + esc(c.style) + '</span></div>' +
       '<div class="kv"><span class="k">Color</span><span class="v">' + esc(c.color) + '</span></div>' +
       '<div class="kv"><span class="k">Width</span><span class="v">' + fmtWidth(c.widthIn) + '</span></div>' +
@@ -982,14 +998,85 @@ Screens.count = function (param) {
       '<div class="kv"><span class="k">Physical Balance</span><span class="v num">' + fmtLen(c.physicalIn) + '</span></div>' +
       '<div class="kv"><span class="k">Difference</span><span class="v ' + diffCls(c.diffIn) + ' num">' + fmtDiff(c.diffIn) + '</span></div>' +
       '<div class="kv"><span class="k">Employee</span><span class="v">' + esc(c.employee) + '</span></div>' +
-      '<div class="kv"><span class="k">Date</span><span class="v">' + new Date(c.at).toLocaleDateString() + '</span></div>' +
-      '<div class="kv"><span class="k">Time</span><span class="v">' + fmtTime(c.at) + '</span></div>' +
+      '<div class="kv"><span class="k">Date</span><span class="v">' + esc(date) + '</span></div>' +
+      '<div class="kv"><span class="k">Time</span><span class="v">' + esc(time) + '</span></div>' +
       '<div class="kv"><span class="k">Count Status</span><span class="v">' + statusChip(c.status) + '</span></div>' +
     '</div>' +
     '<button class="btn" id="goroll">VIEW ROLL HISTORY</button>' +
     '</div>';
   return { html: html, mount: function () {
     $('#goroll').onclick = function () { go('roll', c.rollId); };
+  }};
+};
+
+/* ---------------- SET TEST SYSTEM BALANCE (supervisor / pilot only) -------------
+   TEMPORARY PILOT FUNCTIONALITY: the prototype is not connected to the Real
+   Floors database yet, so a supervisor can type in the balance the Real Floors
+   system currently shows for a roll. Stored as roll.testBalanceIn (integer
+   inches); systemBalance() returns it when set, and it appears automatically
+   when a worker scans the roll. To integrate the Real Floors API/database
+   later: delete these two screens and the testBalanceIn field, and have
+   systemBalance() fetch the authoritative balance from the backend. */
+Screens.testbal = function () {
+  var rows = DB.data.rolls.map(function (r) {
+    var sys = systemBalance(r.id);
+    var tag = isTestBalance(r) ? ' <span class="stchip st-yellow">TEST</span>' : '';
+    return '<button class="rowbtn" data-tb="' + esc(r.id) + '">' +
+      '<div class="rhead"><b class="mono">' + esc(r.id) + '</b>' + tag + '</div>' +
+      '<div class="sub">' + esc(r.style) + ' &middot; ' + esc(r.color) + ' &middot; loc <b class="mono">' + esc(r.expectedLocation) + '</b></div>' +
+      '<div class="sub num">System Balance: <b>' + fmtLen(sys) + '</b></div></button>';
+  }).join('');
+  return { html:
+    '<div class="screen">' +
+    '<div class="step-head">SUPERVISOR &mdash; PILOT SETUP</div>' +
+    '<h1>Set test system balance</h1>' +
+    '<p class="hint"><b>Temporary pilot feature.</b> Enter the balance the Real Floors system shows for each roll. ' +
+    'It appears automatically when a worker scans that roll. This is replaced by the Real Floors API later.</p>' +
+    rows +
+    '</div>',
+    mount: function () {
+      Array.prototype.forEach.call(document.querySelectorAll('[data-tb]'), function (b) {
+        b.onclick = function () { go('testbaledit', b.getAttribute('data-tb')); };
+      });
+    }};
+};
+
+Screens.testbaledit = function (param) {
+  var roll = rollById(param);
+  if (!roll) { setTimeout(function () { go('testbal'); }, 0); return { html: '' }; }
+  var cur = roll.testBalanceIn;
+  var html =
+    '<div class="screen">' +
+    '<div class="step-head">SUPERVISOR &mdash; PILOT SETUP</div>' +
+    '<h1 class="mono">' + esc(roll.id) + '</h1>' +
+    '<p class="hint">Enter the balance the <b>Real Floors system</b> currently shows for this roll.</p>' +
+    (cur != null
+      ? '<p class="hint">Current test balance: <b class="num">' + fmtLen(cur) + '</b></p>'
+      : '<p class="hint">No test balance set &mdash; workers see the computed balance <b class="num">' + fmtLen(systemBalance(roll.id)) + '</b>.</p>') +
+    '<div class="btn-row">' +
+      '<div class="field" style="flex:1"><label class="label">FEET</label>' +
+      '<input class="input num" id="tft" inputmode="numeric" autocomplete="off" placeholder="0"></div>' +
+      '<div class="field" style="flex:1"><label class="label">INCHES</label>' +
+      '<input class="input num" id="tin" inputmode="decimal" autocomplete="off" placeholder="0"></div>' +
+    '</div>' +
+    '<div class="err" id="tberr" hidden></div>' +
+    '<button class="btn btn-primary btn-huge" id="tbsave">SAVE TEST BALANCE</button>' +
+    (cur != null ? '<button class="btn btn-huge" id="tbclear">CLEAR &mdash; USE COMPUTED BALANCE</button>' : '') +
+    '<button class="btn" id="tbcancel">CANCEL</button>' +
+    '</div>';
+  return { html: html, mount: function () {
+    if (cur != null) { $('#tft').value = Math.floor(cur / 12); $('#tin').value = cur % 12; }
+    $('#tbsave').onclick = function () {
+      var ft = $('#tft').value.trim(), inch = $('#tin').value.trim();
+      if (ft === '' && inch === '') { bad(); var e = $('#tberr'); e.textContent = 'Enter feet and inches.'; e.hidden = false; return; }
+      var f = parseFloat(ft || '0'), i = parseFloat(inch || '0');
+      if (isNaN(f) || isNaN(i) || f < 0 || i < 0) { bad(); var e2 = $('#tberr'); e2.textContent = 'Numbers must be zero or more.'; e2.hidden = false; return; }
+      roll.testBalanceIn = Math.round(f * 12 + i);
+      DB.save(); good(); go('testbal');
+    };
+    var clr = $('#tbclear');
+    if (clr) clr.onclick = function () { roll.testBalanceIn = null; DB.save(); good(); go('testbal'); };
+    $('#tbcancel').onclick = function () { go('testbal'); };
   }};
 };
 
@@ -1032,6 +1119,12 @@ Screens.dashboard = function () {
     '<div class="field"><input class="input" id="dq" autocomplete="off" placeholder="Roll, location, style, color, employee, date&hellip;"></div>' +
     '<div class="chiprow" id="dchips"><button class="fchip on" data-f="">ALL</button>' + chips + '</div>' +
     '<div id="dresults"></div>' +
+    '<h2>Pilot setup</h2>' +
+    '<div class="card">' +
+      '<button class="btn btn-huge" id="gotestbal">&#9874; SET TEST SYSTEM BALANCE</button>' +
+      '<button class="btn btn-red btn-huge" id="resetcounts">RESET TEST DATA</button>' +
+      '<p class="hint">Reset test data clears <b>cycle counts only</b> &mdash; rolls, cuts, test balances, and the barcode scanner are untouched.</p>' +
+    '</div>' +
     '<div class="foot"><button class="linklike" id="resetdemo">Reset demo data</button></div>' +
     '</div>';
   return { html: html, mount: function () {
@@ -1059,6 +1152,16 @@ Screens.dashboard = function () {
     });
     $('#resetdemo').onclick = function () {
       if (confirm('Reset all demo data to the seeded sample?')) { DB.reset(); good(); render(); }
+    };
+    $('#gotestbal').onclick = function () { go('testbal'); };
+    $('#resetcounts').onclick = function () {
+      var n = DB.data.counts.length;
+      if (n === 0) { alert('No cycle counts to clear.'); return; }
+      if (confirm('RESET TEST DATA?\n\nThis clears ' + n + ' saved cycle count' + (n === 1 ? '' : 's') + '.\n\nRoll data, cuts, test system balances, and the barcode scanner are NOT affected.\nThis cannot be undone.')) {
+        DB.data.counts = [];
+        DB.save();
+        good(); render();
+      }
     };
     apply();
   }};
