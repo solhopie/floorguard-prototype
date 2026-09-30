@@ -265,3 +265,53 @@ textarea.input { font-size: 1.1rem; min-height: 96px; }
 .btn-xs {
   padding: 6px 12px; font-size: .85rem; min-height: 0; width: auto;
 }
+
+/* ---- PILOT SESSION & MANAGER REPORT ---- */
+.sessbar {
+  background: #0e2a1a; border: 1px solid #2f7d4f; border-radius: 8px;
+  padding: 8px 12px; margin: 8px 0; font-size: .85rem; line-height: 1.7;
+  color: var(--text);
+}
+.sessbar-live { font-size: .8rem; }
+.sessbar-id { color: var(--muted); font-size: .8rem; }
+.sessbar-nums b { color: #7ee2a8; }
+.fchips { display: flex; flex-wrap: wrap; gap: 8px; margin: 4px 0 8px; }
+.fchip {
+  padding: 8px 14px; border-radius: 999px; border: 1px solid #3a4a5a;
+  background: #1c2530; color: var(--text); font-size: .9rem; cursor: pointer;
+}
+.fchip.on { background: var(--blue); border-color: var(--blue); color: #fff; font-weight: 700; }
+.rtable-wrap { overflow-x: auto; margin: 0 -4px; }
+.rtable { border-collapse: collapse; width: 100%; min-width: 760px; font-size: .85rem; }
+.rtable th, .rtable td {
+  padding: 8px 10px; border-bottom: 1px solid #2a3542; text-align: left; white-space: nowrap;
+}
+.rtable th { color: var(--muted); font-size: .72rem; letter-spacing: .04em; }
+.rtable tbody tr[data-goto] { cursor: pointer; }
+.rtable tbody tr[data-goto]:active { background: #1c2a3a; }
+.sessrow {
+  display: block; width: 100%; text-align: left; background: var(--card);
+  border: 1px solid #2a3542; border-radius: 10px; padding: 12px 14px; margin: 8px 0;
+  color: var(--text); cursor: pointer; font-size: .95rem;
+}
+.sessrow-top { display: flex; justify-content: space-between; align-items: baseline; }
+.sessrow-sub { color: var(--muted); font-size: .85rem; margin-top: 4px; }
+.btn-warn { background: #7a5c00; border-color: #a37e00; color: #fff; }
+.ptable { border-collapse: collapse; width: 100%; font-size: .85rem; margin: 8px 0 16px; }
+.ptable th, .ptable td { border: 1px solid #999; padding: 6px 8px; text-align: left; }
+.ptable th { background: #eee; }
+.print-report { background: #fff; color: #000; }
+.print-report h1 { font-size: 1.3rem; margin: 8px 0 2px; }
+.print-report h2 { font-size: 1.05rem; margin: 18px 0 4px; border-bottom: 2px solid #000; padding-bottom: 2px; }
+.print-report .card { background: #fff; border: 1px solid #999; box-shadow: none; }
+.print-report .sub { color: #444; }
+
+@media print {
+  .topbar, .backbtn, .btn, .noprint, .sessbar, .fchips { display: none !important; }
+  body { background: #fff; }
+  .screen { max-width: none; padding: 0 4px; }
+  .print-report, .print-report h1, .print-report h2, .print-report .sub,
+  .print-report td, .print-report th { color: #000; }
+  .print-report .card { border: 1px solid #999; background: #fff; box-shadow: none; }
+  .rtable-wrap { overflow: visible; }
+}

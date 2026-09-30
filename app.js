@@ -351,10 +351,14 @@ var STATUS = {
   OVER:             { label: 'OVER',             chip: 'st-yellow' },
   LOCATION_MISMATCH:{ label: 'LOCATION MISMATCH',chip: 'st-red'    },
   NEEDS_REVIEW:     { label: 'NEEDS REVIEW',     chip: 'st-yellow' },
+  LOCATION_ISSUE:   { label: 'LOCATION ISSUE',   chip: 'st-red'    },
+  NEWLY_DISCOVERED: { label: 'NEWLY DISCOVERED', chip: 'st-blue'   },
   COLLECTED:        { label: 'COLLECTED',        chip: 'st-blue'   }
 };
 function statusChip(status) {
-  var m = STATUS[status] || STATUS.NEEDS_REVIEW;
+  /* Accept both key form (LOCATION_ISSUE) and label form ('LOCATION ISSUE'),
+     since status producers use the human-readable label. */
+  var m = STATUS[status] || STATUS[String(status).replace(/ /g, '_')] || STATUS.NEEDS_REVIEW;
   return '<span class="stchip ' + m.chip + '">' + m.label + '</span>';
 }
 /* Location mismatch always wins over the balance comparison. */
@@ -573,6 +577,9 @@ var TITLES = {
   'free-loc': 'Free Run — Scan Location', 'free-scan': 'Free Run — Discovery Mode',
   'free-balance': 'Free Run — Enter Balance', 'free-summary': 'Free Run — Session Summary',
   discrepancies: 'Cycle Count Discrepancies',
+  sessions: 'Count Sessions', sessview: 'Session Summary',
+  report: 'Manager Report', export: 'Export Report', 'report-print': 'Print Report',
+  'disc-roll': 'Roll Detail',
   'doc-capture': 'Scan History Card', 'doc-review': 'Review History Card',
   'doc-view': 'History Card', 'doc-extract': 'Extract History'
 };
@@ -618,6 +625,7 @@ Screens.home = function () {
     '<button class="btn btn-home" id="b-search">&#128269; SEARCH ROLL</button>' +
     '<button class="btn btn-home" id="b-recent">&#9776; RECENT COUNTS</button>' +
     '<button class="btn btn-home" id="b-dash">&#128202; SUPERVISOR DASHBOARD</button>' +
+    '<button class="btn btn-home" id="b-sessions">&#128203; COUNT SESSIONS</button>' +
     '<div class="foot">Prototype v1 &middot; mock data &middot; works offline</div>' +
     '</div>';
   return { html: html, mount: function () {
@@ -629,6 +637,7 @@ Screens.home = function () {
     $('#b-search').onclick = function () { go('search'); };
     $('#b-recent').onclick = function () { go('recent'); };
     $('#b-dash').onclick = function () { go('dashboard'); };
+    $('#b-sessions').onclick = function () { go('sessions'); };
   }};
 };
 
@@ -1493,6 +1502,105 @@ function findFreeSession(id) {
   return null;
 }
 
+/* ================= PILOT SESSION & MANAGER REPORT =================
+   Everything in this block is read-only reporting over the existing
+   Free Run collections (freeSessions, freeCounts, discovered, documents).
+   No existing counting/cut/scanner behavior is changed by these helpers. */
+
+/* Human duration: 937000 -> "15m 37s", 5000 -> "5s". */
+function fmtDur(ms) {
+  if (ms == null || isNaN(ms) || ms < 0) return '—';
+  var s = Math.round(ms / 1000);
+  var h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+  if (h > 0) return h + 'h ' + m + 'm';
+  if (m > 0) return m + 'm ' + (s % 60) + 's';
+  return s + 's';
+}
+
+/* Per-count manager status for Free Run. Priority order:
+   NEEDS REVIEW > LOCATION ISSUE > NEWLY DISCOVERED > MATCH/SHORT/OVER.
+   A count is a discrepancy when its status is SHORT, OVER, LOCATION ISSUE,
+   or NEEDS REVIEW. */
+function freeCountStatus(c) {
+  if (c.needsReview) return 'NEEDS REVIEW';
+  if (c.locationIssue) return 'LOCATION ISSUE';
+  if (c.discovered) return 'NEWLY DISCOVERED';
+  if (c.expectedIn == null) return 'COLLECTED';
+  var d = c.physicalIn - c.expectedIn;
+  return d === 0 ? 'MATCH' : (d < 0 ? 'SHORT' : 'OVER');
+}
+function freeCountDiff(c) {
+  return (c.expectedIn == null || c.physicalIn == null) ? null : c.physicalIn - c.expectedIn;
+}
+function isDiscrepancy(c) {
+  var st = freeCountStatus(c);
+  return st === 'SHORT' || st === 'OVER' || st === 'LOCATION ISSUE' || st === 'NEEDS REVIEW';
+}
+
+/* One denormalized row per counted roll in a session, for the report table. */
+function reportRows(sessId) {
+  return freeCountsFor(sessId).map(function (c) {
+    var roll = c.discovered ? null : rollByBarcode(c.rollId);
+    var sessDocs = docsForRoll(c.rollId).filter(function (d) { return d.sessionId === sessId; });
+    return {
+      loc: c.location, rollId: c.rollId, raw: c.raw || c.rollId,
+      style: roll ? roll.style : '—', color: roll ? roll.color : '—',
+      expectedIn: c.expectedIn, physicalIn: c.physicalIn,
+      diffIn: freeCountDiff(c), mb: !!c.measured,
+      docs: sessDocs.length, docIds: sessDocs.map(function (d) { return d.id; }),
+      status: freeCountStatus(c), employee: c.employee, time: c.time, at: c.at,
+      discovered: !!c.discovered, note: c.note || '', needsReview: !!c.needsReview,
+      locationIssue: !!c.locationIssue
+    };
+  }).sort(function (a, b) { return new Date(a.at) - new Date(b.at); });
+}
+
+/* Pilot metrics for a session: §11 of the pilot spec. */
+function sessionMetrics(sessId) {
+  var counts = freeCountsFor(sessId).slice()
+    .sort(function (a, b) { return new Date(a.at) - new Date(b.at); });
+  var locs = {}, rolls = {}, review = 0, disc = 0;
+  counts.forEach(function (c) {
+    locs[c.location] = 1; rolls[c.rollId] = 1;
+    if (isDiscrepancy(c)) disc++;
+    if (c.needsReview) review++;
+  });
+  var avgMs = null;
+  if (counts.length > 1) {
+    var gaps = 0;
+    for (var i = 1; i < counts.length; i++)
+      gaps += new Date(counts[i].at) - new Date(counts[i - 1].at);
+    avgMs = gaps / (counts.length - 1);
+  }
+  var sess = findFreeSession(sessId);
+  var totalMs = (sess && sess.endedAt)
+    ? new Date(sess.endedAt) - new Date(sess.startedAt) : null;
+  var cards = (DB.data.documents || []).filter(function (d) { return d.sessionId === sessId; }).length;
+  return {
+    rolls: counts.length, locations: Object.keys(locs).length,
+    uniqueRolls: Object.keys(rolls).length, avgMs: avgMs, totalMs: totalMs,
+    discrepancies: disc, needsReview: review, historyCards: cards
+  };
+}
+
+/* Live session counter strip (§3): small, non-blocking, sits under the step head. */
+function freeSessionBar() {
+  if (!F || !F.id) return '';
+  var counts = freeCountsFor(F.id);
+  var locs = {}, measured = 0, review = 0;
+  counts.forEach(function (c) {
+    locs[c.location] = 1;
+    if (c.measured) measured++;
+    if (isDiscrepancy(c)) review++;
+  });
+  return '<div class="sessbar"><span class="sessbar-live">&#128994;</span> ' +
+    '<b>SESSION IN PROGRESS</b> <span class="mono sessbar-id">' + esc(F.id) + '</span>' +
+    '<div class="sessbar-nums">Locations <b>' + Object.keys(locs).length + '</b>' +
+    ' &middot; Rolls Counted <b>' + counts.length + '</b>' +
+    ' &middot; Measured <b>' + measured + '</b>' +
+    ' &middot; Needs Review <b>' + review + '</b></div></div>';
+}
+
 /* --- STEP 1: scan ANY location. No DB requirement. --- */
 Screens['free-loc'] = function () {
   if (!F) newFreeRun();
@@ -1545,6 +1653,7 @@ Screens['free-scan'] = function () {
   var html =
     '<div class="screen">' +
     '<div class="step-head">FREE RUN &mdash; DISCOVERY MODE</div>' +
+    freeSessionBar() +
     '<div class="card" style="text-align:center">' +
       '<div class="label">ACTIVE LOCATION</div>' +
       '<div class="mono" style="font-size:2.4rem;font-weight:900">' + esc(F.activeLoc) + '</div>' +
@@ -1573,7 +1682,13 @@ Screens['free-scan'] = function () {
       c.onclick = function () { onCode(c.getAttribute('data-code')); };
     });
     $('#fchangeloc').onclick = function () { go('free-loc'); };
-    $('#fend').onclick = endFreeSession;
+    /* §4: confirm before finishing — CANCEL / FINISH. */
+    $('#fend').onclick = function () {
+      var n = freeCountsFor(F.id).length;
+      if (confirm('FINISH THIS CYCLE COUNT?\n\n' + n + ' roll' + (n === 1 ? '' : 's') +
+          ' collected in session ' + F.id + '.\n\nCANCEL to keep counting, FINISH to end the session.'))
+        endFreeSession();
+    };
   }};
   function onCode(code) {
     var raw = String(code || '').trim();
@@ -1633,6 +1748,7 @@ Screens['free-balance'] = function () {
   var html =
     '<div class="screen">' +
     '<div class="step-head">FREE RUN &mdash; DISCOVERY MODE &mdash; ' + esc(F.activeLoc) + '</div>' +
+    freeSessionBar() +
     '<div class="card" style="text-align:center">' +
       '<div class="label">ROLL SCANNED</div>' +
       '<div class="mono" style="font-size:2.2rem;font-weight:900">' + esc(s.rollId) + '</div>' +
@@ -1646,6 +1762,9 @@ Screens['free-balance'] = function () {
     '</div>' +
     '<div class="label">MEASURED BALANCE</div>' +
     '<button class="btn" id="fdochist" style="margin-bottom:14px">&#128247; SCAN HISTORY CARD <span class="sub">(optional)</span></button>' +
+    '<button class="btn" id="fflag">&#9873; FLAG FOR REVIEW <span class="sub">(optional)</span></button>' +
+    '<div class="field" id="fflagwrap" hidden style="margin-top:8px"><label class="label" for="fnote">REVIEW NOTE</label>' +
+    '<input class="input" id="fnote" autocomplete="off" placeholder="e.g. label damaged, move pending"></div>' +
     '<div class="btn-row">' +
       '<div class="field" style="flex:1"><label class="label">FEET</label>' +
       '<input class="input num" id="fft" inputmode="numeric" autocomplete="off" placeholder="0" style="font-size:2.2rem;min-height:84px;text-align:center"></div>' +
@@ -1665,6 +1784,17 @@ Screens['free-balance'] = function () {
     };
     $('#fft').oninput = upd; $('#fin').oninput = upd;
     $('#fback').onclick = function () { F.scan = null; go('free-scan'); };
+    /* FLAG FOR REVIEW: optional toggle. When on, the saved count carries
+       needsReview=true plus the note, and shows up in NEEDS REVIEW. */
+    $('#fflag').onclick = function () {
+      s.flagReview = !s.flagReview;
+      var on = s.flagReview;
+      $('#fflag').className = 'btn' + (on ? ' btn-warn' : '');
+      $('#fflag').innerHTML = on ? '&#9873; FLAGGED FOR REVIEW &mdash; TAP TO UNFLAG' : '&#9873; FLAG FOR REVIEW <span class="sub">(optional)</span>';
+      $('#fflagwrap').hidden = !on;
+      if (on) setTimeout(function () { $('#fnote').focus(); }, 50);
+      else s.flagNote = '';
+    };
     $('#fdochist').onclick = function () {
       /* Optional: capture the paper history card, then come back here to
          enter the measured balance. Never forced, normally once per roll. */
@@ -1677,6 +1807,7 @@ Screens['free-balance'] = function () {
       if ($('#fft').value.trim() === '' && $('#fin').value.trim() === '') err = 'Enter feet and/or inches.';
       else if (isNaN(ft) || isNaN(inch) || ft < 0 || inch < 0) err = 'Numbers must be zero or more.';
       if (err) { bad(); var e = $('#ferr'); e.textContent = err; e.hidden = false; return; }
+      s.flagNote = s.flagReview ? ($('#fnote').value || '') : '';
       saveFreeCount(ft, inch);
     };
   }};
@@ -1698,7 +1829,15 @@ function saveFreeCount(ft, inch) {
     measured: true,          /* MB: the worker physically measured this roll */
     employee: DB.data.currentEmployee,
     at: now.toISOString(),
-    date: now.toLocaleDateString(), time: fmtTime(now.toISOString())
+    date: now.toLocaleDateString(), time: fmtTime(now.toISOString()),
+    /* Pilot session fields (§2): optional review flag + note; locationIssue is
+       auto-detected when a known roll is counted away from its expected
+       location. Older records simply lack these fields (treated as false). */
+    needsReview: !!(s.flagReview), note: (s.flagNote || '').trim() || null,
+    locationIssue: (s.known && (function () {
+      var r = rollByBarcode(s.rollId);
+      return r && normLoc(F.activeLoc) !== normLoc(r.expectedLocation);
+    })())
   };
   DB.data.freeCounts.push(rec);
   if (s.known) {
@@ -1737,14 +1876,66 @@ function endFreeSession() {
 /* --- SESSION SUMMARY: supervisor review of the whole collected count --- */
 Screens['free-summary'] = function () {
   if (!F || !F.id) { setTimeout(function () { go('home'); }, 0); return { html: '' }; }
-  var sess = findFreeSession(F.id);
-  var counts = freeCountsFor(F.id).slice().sort(function (a, b) { return new Date(b.at) - new Date(a.at); });
-  var locs = [], rolls = [], disc = [];
+  var sessId = F.id;
+  return { html: sessionSummaryHtml(sessId, 'DONE &mdash; BACK TO HOME'), mount: function () {
+    mountSessionSummary(sessId, function () { F = null; go('home'); });
+  }};
+};
+
+/* --- PAST SESSION VIEW: reopen any finished session from COUNT SESSIONS --- */
+Screens['sessview'] = function (sessId) {
+  var sess = findFreeSession(sessId);
+  if (!sess) { setTimeout(function () { go('sessions'); }, 0); return { html: '' }; }
+  return { html: sessionSummaryHtml(sessId, '&larr; BACK TO SESSIONS'), mount: function () {
+    mountSessionSummary(sessId, function () { go('sessions'); });
+  }};
+};
+
+/* --- COUNT SESSIONS: list of every finished Free Run pilot session --- */
+Screens['sessions'] = function () {
+  var ss = (DB.data.freeSessions || []).slice()
+    .sort(function (a, b) { return new Date(b.startedAt) - new Date(a.startedAt); });
+  var rows = ss.map(function (s) {
+    var m = sessionMetrics(s.id);
+    return '<button class="sessrow" data-sess="' + esc(s.id) + '">' +
+      '<div class="sessrow-top"><span class="mono"><b>' + esc(s.id) + '</b></span>' +
+      '<span class="sub">' + esc(new Date(s.startedAt).toLocaleDateString()) + '</span></div>' +
+      '<div class="sessrow-sub">' + esc(s.startedBy || '—') +
+      ' &middot; ' + m.rolls + ' rolls &middot; ' + m.locations + ' locations' +
+      ' &middot; ' + fmtDur(m.totalMs) +
+      (m.discrepancies ? ' &middot; <span style="color:var(--red)">' + m.discrepancies + ' need review</span>' : '') +
+      '</div></button>';
+  }).join('');
+  var html =
+    '<div class="screen">' +
+    '<button class="backbtn" id="back">&larr; HOME</button>' +
+    '<div class="step-head">PILOT SESSIONS</div>' +
+    '<h1>&#128203; COUNT SESSIONS</h1>' +
+    '<p class="hint">Finished Free Run cycle-count sessions. Open one for its summary, manager report, and exports.</p>' +
+    (rows || '<div class="hint center">No finished sessions yet.</div>') +
+    '</div>';
+  return { html: html, mount: function () {
+    $('#back').onclick = function () { go('home'); };
+    Array.prototype.forEach.call(document.querySelectorAll('[data-sess]'), function (b) {
+      b.onclick = function () { go('sessview', b.getAttribute('data-sess')); };
+    });
+  }};
+};
+
+/* --- SESSION SUMMARY (§5): shared renderer for free-summary + sessview --- */
+function sessionSummaryHtml(sessId, doneLabel) {
+  var sess = findFreeSession(sessId) || {};
+  var m = sessionMetrics(sessId);
+  var counts = freeCountsFor(sessId).slice()
+    .sort(function (a, b) { return new Date(b.at) - new Date(a.at); });
+  var locs = [], disc = [];
   counts.forEach(function (c) {
     if (locs.indexOf(c.location) < 0) locs.push(c.location);
-    if (rolls.indexOf(c.rollId) < 0) rolls.push(c.rollId);
     if (c.discovered && disc.indexOf(c.rollId) < 0) disc.push(c.rollId);
   });
+  function kv(k, v) {
+    return '<div class="kv"><span class="k">' + k + '</span><span class="v">' + v + '</span></div>';
+  }
   var rows = counts.map(function (c) {
     return '<div class="trow">' +
       '<div class="mono"><b>' + esc(c.location) + '</b></div>' +
@@ -1777,14 +1968,20 @@ Screens['free-summary'] = function () {
     '<div class="step-head">FREE RUN &mdash; DISCOVERY MODE</div>' +
     '<h1>&#10003; CYCLE COUNT COMPLETE</h1>' +
     '<div class="card">' +
-      '<div class="kv"><span class="k">Locations Scanned</span><span class="v num">' + locs.length + '</span></div>' +
-      '<div class="kv"><span class="k">Rolls Counted</span><span class="v num">' + counts.length + '</span></div>' +
-      '<div class="kv"><span class="k">Measured Rolls</span><span class="v num">' + rolls.length + '</span></div>' +
-      '<div class="kv"><span class="k">Unknown/New Rolls Discovered</span><span class="v num">' + disc.length + '</span></div>' +
-      '<div class="kv"><span class="k">Started</span><span class="v">' + fmtDT(F.startedAt) + '</span></div>' +
-      '<div class="kv"><span class="k">Completed</span><span class="v">' + fmtDT(F.endedAt || (sess && sess.endedAt) || new Date().toISOString()) + '</span></div>' +
-      '<div class="kv"><span class="k">Employee</span><span class="v">' + esc(F.startedBy) + '</span></div>' +
+      kv('Employee', esc(sess.startedBy || '—')) +
+      kv('Session', '<span class="mono">' + esc(sessId) + '</span>') +
+      kv('Started', sess.startedAt ? fmtDT(sess.startedAt) : '—') +
+      kv('Completed', sess.endedAt ? fmtDT(sess.endedAt) : '—') +
+      kv('Duration', fmtDur(m.totalMs)) +
+      kv('Locations Counted', '<span class="num">' + m.locations + '</span>') +
+      kv('Rolls Counted', '<span class="num">' + m.rolls + '</span>') +
+      kv('Measured Balances', '<span class="num">' + m.rolls + '</span>') +
+      kv('History Cards Captured', '<span class="num">&#128247; ' + m.historyCards + '</span>') +
+      kv('Discrepancies', '<span class="num">' + m.discrepancies + '</span>') +
+      kv('Needs Review', '<span class="num">' + m.needsReview + '</span>') +
     '</div>' +
+    '<button class="btn btn-primary btn-huge" id="sreport">&#128202; VIEW MANAGER REPORT</button>' +
+    '<button class="btn" id="sexport">&#8681; EXPORT REPORT</button>' +
     '<div class="h2">Collected Counts</div>' +
     '<div class="thead trow"><div>LOCATION</div><div>ROLL</div><div>MEASURED</div><div>MB</div><div>TIME</div></div>' +
     (rows || '<div class="hint center">No rolls counted in this session.</div>') +
@@ -1792,10 +1989,339 @@ Screens['free-summary'] = function () {
     (discRows || '<div class="hint center">No new rolls discovered.</div>') +
     '<div class="h2">Discovered Locations</div>' +
     '<div class="card">' + (locChips || '<span class="hint">None.</span>') + '</div>' +
-    '<button class="btn btn-primary btn-huge" id="fdone">DONE &mdash; BACK TO HOME</button>' +
+    '<button class="btn btn-primary btn-huge" id="fdone">' + doneLabel + '</button>' +
+    '</div>';
+  return html;
+}
+function mountSessionSummary(sessId, onDone) {
+  $('#fdone').onclick = onDone;
+  $('#sreport').onclick = function () { go('report', sessId); };
+  $('#sexport').onclick = function () { go('export', sessId); };
+  wireDocViews();
+}
+
+/* ================= MANAGER REPORT (§6) =================
+   Professional per-session warehouse report over reportRows():
+   filterable table + ITEMS REQUIRING REVIEW + tap-through roll detail.
+   Read-only: nothing here changes counts, balances, or inventory. */
+var REPORT_FILTERS = ['ALL', 'MATCH', 'SHORT', 'OVER', 'NEEDS REVIEW', 'NEWLY DISCOVERED'];
+function reportFilterLabel(f) {
+  var m = { ALL: 'All', MATCH: 'Match', SHORT: 'Short', OVER: 'Over',
+            'NEEDS REVIEW': 'Needs Review', 'NEWLY DISCOVERED': 'Newly Discovered' };
+  return m[f] || f;
+}
+
+function reportRowHtml(r) {
+  var target = r.discovered ? 'disc-roll' : 'roll';
+  return '<tr data-goto="' + target + '" data-roll="' + esc(r.rollId) + '">' +
+    '<td class="mono"><b>' + esc(r.loc) + '</b></td>' +
+    '<td class="mono">' + esc(r.rollId) + (r.discovered ? ' <span class="stchip st-blue">NEW</span>' : '') + '</td>' +
+    '<td>' + esc(r.style) + '</td>' +
+    '<td>' + esc(r.color) + '</td>' +
+    '<td class="num">' + (r.expectedIn != null ? fmtLen(r.expectedIn) : '<span class="sub">—</span>') + '</td>' +
+    '<td class="num"><b>' + fmtLen(r.physicalIn) + '</b></td>' +
+    '<td class="num ' + (r.diffIn == null ? '' : diffCls(r.diffIn)) + '">' +
+      (r.diffIn == null ? '<span class="sub">—</span>' : fmtDiff(r.diffIn)) + '</td>' +
+    '<td class="center">✓</td>' +
+    '<td class="center">' + (r.docs ? '&#128247; ' + r.docs : '<span class="sub">—</span>') + '</td>' +
+    '<td>' + statusChip(r.status) + '</td>' +
+    '<td class="sub">' + esc(r.time) + '</td></tr>';
+}
+function reportTableHtml(rows) {
+  if (!rows.length) return '<div class="hint center">No rows match this filter.</div>';
+  return '<div class="rtable-wrap"><table class="rtable"><thead><tr>' +
+    '<th>LOCATION</th><th>ROLL</th><th>STYLE</th><th>COLOR</th><th>EXPECTED BALANCE</th>' +
+    '<th>MEASURED BALANCE</th><th>DIFFERENCE</th><th>MB</th><th>HISTORY CARD</th><th>STATUS</th><th>TIME</th>' +
+    '</tr></thead><tbody>' + rows.map(reportRowHtml).join('') + '</tbody></table></div>';
+}
+function filterReportRows(rows, f) {
+  if (f === 'ALL') return rows;
+  return rows.filter(function (r) { return r.status === f; });
+}
+
+Screens['report'] = function (sessId) {
+  var sess = findFreeSession(sessId);
+  if (!sess) { setTimeout(function () { go('sessions'); }, 0); return { html: '' }; }
+  var rows = reportRows(sessId);
+  var m = sessionMetrics(sessId);
+  var cur = 'ALL';
+  function chipsHtml() {
+    return REPORT_FILTERS.map(function (f) {
+      return '<button class="fchip' + (f === cur ? ' on' : '') + '" data-f="' + f + '">' +
+        reportFilterLabel(f) + '</button>';
+    }).join('');
+  }
+  function tableArea() {
+    var fr = filterReportRows(rows, cur);
+    var disc = rows.filter(isDiscrepancyRow);
+    return '<div class="h2">Results <span class="sub">(' + fr.length + ' of ' + rows.length + ')</span></div>' +
+      reportTableHtml(fr) +
+      '<div class="h2">&#9888; ITEMS REQUIRING REVIEW <span class="sub">(' + disc.length + ')</span></div>' +
+      (disc.length ? reportTableHtml(disc)
+        : '<div class="hint center">Nothing needs review — every counted roll matched.</div>');
+  }
+  function isDiscrepancyRow(r) {
+    return r.status === 'SHORT' || r.status === 'OVER' || r.status === 'LOCATION ISSUE' || r.status === 'NEEDS REVIEW';
+  }
+  var html =
+    '<div class="screen">' +
+    '<button class="backbtn" id="back">&larr; BACK</button>' +
+    '<div class="step-head">PILOT SESSION &mdash; MANAGER REPORT</div>' +
+    '<h1>&#128202; MANAGER REPORT</h1>' +
+    '<div class="card"><div class="kv"><span class="k">Session</span><span class="v mono">' + esc(sessId) + '</span></div>' +
+    '<div class="kv"><span class="k">Employee</span><span class="v">' + esc(sess.startedBy || '—') + '</span></div>' +
+    '<div class="kv"><span class="k">Date</span><span class="v">' + esc(new Date(sess.startedAt).toLocaleDateString()) + '</span></div></div>' +
+    '<div class="h2">Pilot Metrics</div>' +
+    '<div class="card">' +
+    '<div class="kv"><span class="k">Total Rolls Counted</span><span class="v num">' + m.rolls + '</span></div>' +
+    '<div class="kv"><span class="k">Total Locations</span><span class="v num">' + m.locations + '</span></div>' +
+    '<div class="kv"><span class="k">Avg Count Time / Roll</span><span class="v num">' + fmtDur(m.avgMs) + '</span></div>' +
+    '<div class="kv"><span class="k">Total Session Time</span><span class="v num">' + fmtDur(m.totalMs) + '</span></div>' +
+    '<div class="kv"><span class="k">Discrepancies</span><span class="v num">' + m.discrepancies + '</span></div>' +
+    '<div class="kv"><span class="k">History Cards Digitized</span><span class="v num">&#128247; ' + m.historyCards + '</span></div>' +
+    '</div>' +
+    '<div class="h2">Filter</div>' +
+    '<div class="fchips" id="fchips">' + chipsHtml() + '</div>' +
+    '<div id="rtables">' + tableArea() + '</div>' +
+    '<p class="hint center">Tap any roll row to open its full FloorGuard detail.</p>' +
+    '<button class="btn" id="bexport">&#8681; EXPORT REPORT</button>' +
     '</div>';
   return { html: html, mount: function () {
-    $('#fdone').onclick = function () { F = null; go('home'); };
+    $('#back').onclick = function () { history.back(); };
+    $('#bexport').onclick = function () { go('export', sessId); };
+    function wireRows() {
+      Array.prototype.forEach.call(document.querySelectorAll('#rtables tr[data-goto]'), function (tr) {
+        tr.onclick = function () { go(tr.getAttribute('data-goto'), tr.getAttribute('data-roll')); };
+      });
+    }
+    function applyFilter(f) {
+      cur = f;
+      $('#fchips').innerHTML = chipsHtml();
+      $('#rtables').innerHTML = tableArea();
+      wireRows();
+      wireChips();
+    }
+    function wireChips() {
+      Array.prototype.forEach.call(document.querySelectorAll('#fchips .fchip'), function (b) {
+        b.onclick = function () { applyFilter(b.getAttribute('data-f')); };
+      });
+    }
+    wireRows();
+    wireChips();
+  }};
+};
+
+/* ================= EXPORT (§8) =================
+   Prototype exports: PRINT/SAVE AS PDF (via the print-optimized view),
+   CSV (every cycle-count row), JSON (structured FloorGuard data). */
+function downloadFile(name, mime, text) {
+  var blob = new Blob([text], { type: mime + ';charset=utf-8' });
+  var a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 800);
+}
+function csvEsc(v) {
+  if (v == null) return '';
+  return '"' + String(v).replace(/"/g, '""') + '"';
+}
+function sessionExportRows(sessId) {
+  var rows = reportRows(sessId);
+  var head = ['session_id', 'location', 'roll', 'barcode_raw', 'style', 'color',
+    'expected_in', 'measured_in', 'difference_in', 'measured_balance_mb',
+    'history_cards', 'status', 'employee', 'time', 'note'];
+  var lines = [head.map(csvEsc).join(',')];
+  rows.forEach(function (r) {
+    lines.push([
+      sessId, r.loc, r.rollId, r.raw, r.style, r.color,
+      r.expectedIn != null ? r.expectedIn : '',
+      r.physicalIn,
+      r.diffIn != null ? r.diffIn : '',
+      r.mb ? 'YES' : 'NO',
+      r.docs, r.status, r.employee, r.time, r.note || ''
+    ].map(csvEsc).join(','));
+  });
+  return lines.join('\r\n');
+}
+function sessionExportJson(sessId) {
+  var sess = findFreeSession(sessId) || {};
+  var docs = (DB.data.documents || []).filter(function (d) { return d.sessionId === sessId; });
+  return JSON.stringify({
+    exportedAt: new Date().toISOString(),
+    exportedBy: DB.data.currentEmployee || null,
+    source: 'FLOORGUARD',
+    session: {
+      id: sessId, employee: sess.startedBy || null,
+      startedAt: sess.startedAt || null, endedAt: sess.endedAt || null,
+      metrics: sessionMetrics(sessId)
+    },
+    rows: reportRows(sessId).map(function (r) {
+      return {
+        location: r.loc, rollId: r.rollId, barcodeRaw: r.raw,
+        style: r.style, color: r.color,
+        expectedIn: r.expectedIn, measuredIn: r.physicalIn, differenceIn: r.diffIn,
+        measuredBalance: r.mb, historyCards: r.docs, historyCardIds: r.docIds,
+        status: r.status, employee: r.employee, time: r.time, at: r.at,
+        discovered: r.discovered, needsReview: r.needsReview,
+        locationIssue: r.locationIssue, note: r.note || null
+      };
+    }),
+    documents: docs.map(function (d) {
+      return {
+        id: d.id, rollId: d.rollId, num: d.num, kind: d.docType,
+        capturedAt: d.at, capturedBy: d.employee, location: d.location,
+        sessionId: d.sessionId, source: d.source,
+        imports: (d.imports || []).map(function (i) {
+          return { fields: i.fields || null, confirmedAt: i.confirmedAt || null, confirmedBy: i.confirmedBy || null };
+        })
+      };
+    })
+  }, null, 2);
+}
+
+Screens['export'] = function (sessId) {
+  var sess = findFreeSession(sessId);
+  if (!sess) { setTimeout(function () { go('sessions'); }, 0); return { html: '' }; }
+  var fname = 'floorguard-session-' + sessId;
+  var html =
+    '<div class="screen">' +
+    '<button class="backbtn" id="back">&larr; BACK</button>' +
+    '<div class="step-head">PILOT SESSION &mdash; EXPORT</div>' +
+    '<h1>&#8681; EXPORT REPORT</h1>' +
+    '<p class="hint">Session <span class="mono">' + esc(sessId) + '</span> &middot; ' +
+      esc(sess.startedBy || '—') + ' &middot; ' + esc(new Date(sess.startedAt).toLocaleDateString()) + '</p>' +
+    '<button class="btn btn-primary btn-huge" id="xpdf">&#128438; PRINT / SAVE AS PDF</button>' +
+    '<p class="hint">Opens the management-review layout. On iPhone: Share &rarr; Save to Files to keep a PDF.</p>' +
+    '<button class="btn btn-huge" id="xcsv">&#8681; DOWNLOAD CSV</button>' +
+    '<p class="hint">Every cycle-count row — opens in Excel / Sheets.</p>' +
+    '<button class="btn btn-huge" id="xjson">&#8681; DOWNLOAD JSON</button>' +
+    '<p class="hint">Structured FloorGuard data for future integration and testing.</p>' +
+    '</div>';
+  return { html: html, mount: function () {
+    $('#back').onclick = function () { history.back(); };
+    $('#xpdf').onclick = function () { go('report-print', sessId); };
+    $('#xcsv').onclick = function () { downloadFile(fname + '.csv', 'text/csv', sessionExportRows(sessId)); good(); };
+    $('#xjson').onclick = function () { downloadFile(fname + '.json', 'application/json', sessionExportJson(sessId)); good(); };
+  }};
+};
+
+/* ================= PRINT REPORT (§8 PDF) =================
+   Print-optimized management review. window.print() -> Save as PDF. */
+Screens['report-print'] = function (sessId) {
+  var sess = findFreeSession(sessId);
+  if (!sess) { setTimeout(function () { go('sessions'); }, 0); return { html: '' }; }
+  var rows = reportRows(sessId);
+  var m = sessionMetrics(sessId);
+  var docs = (DB.data.documents || []).filter(function (d) { return d.sessionId === sessId; })
+    .sort(function (a, b) { return new Date(a.at) - new Date(b.at); });
+  function trow(cells) {
+    return '<tr>' + cells.map(function (c) { return '<td>' + c + '</td>'; }).join('') + '</tr>';
+  }
+  var dataRows = rows.map(function (r) {
+    return trow([
+      esc(r.loc), esc(r.rollId), esc(r.style), esc(r.color),
+      r.expectedIn != null ? fmtLen(r.expectedIn) : '—',
+      fmtLen(r.physicalIn),
+      r.diffIn == null ? '—' : fmtDiff(r.diffIn),
+      r.mb ? 'YES' : 'NO',
+      r.docs ? r.docs + ' card' + (r.docs > 1 ? 's' : '') : '—',
+      esc(r.status), esc(r.time)
+    ]);
+  }).join('');
+  var discRows = rows.filter(function (r) {
+    return r.status === 'SHORT' || r.status === 'OVER' || r.status === 'LOCATION ISSUE' || r.status === 'NEEDS REVIEW';
+  }).map(function (r) {
+    return trow([esc(r.loc), esc(r.rollId),
+      r.expectedIn != null ? fmtLen(r.expectedIn) : '—',
+      fmtLen(r.physicalIn),
+      r.diffIn == null ? '—' : fmtDiff(r.diffIn),
+      esc(r.status), esc(r.note || '—')]);
+  }).join('');
+  var docRows = docs.map(function (d) {
+    return trow(['<b>' + esc(d.rollId) + '</b>', 'HISTORY CARD #' + d.num,
+      esc(d.employee || '—'), d.at ? new Date(d.at).toLocaleString() : '—',
+      esc(d.location || '—')]);
+  }).join('');
+  var html =
+    '<div class="screen print-report">' +
+    '<div class="noprint"><button class="backbtn" id="back">&larr; BACK</button>' +
+    '<button class="btn btn-primary btn-huge" id="doprint">&#128438; PRINT / SAVE AS PDF</button></div>' +
+    '<h1>FLOORGUARD &mdash; CYCLE COUNT MANAGER REPORT</h1>' +
+    '<div class="sub">Generated ' + new Date().toLocaleString() + ' by ' + esc(DB.data.currentEmployee || '—') + '</div>' +
+    '<h2>Session</h2>' +
+    '<table class="ptable"><tbody>' +
+    trow(['<b>Session ID</b>', esc(sessId)]) +
+    trow(['<b>Employee</b>', esc(sess.startedBy || '—')]) +
+    trow(['<b>Started</b>', sess.startedAt ? fmtDT(sess.startedAt) : '—']) +
+    trow(['<b>Completed</b>', sess.endedAt ? fmtDT(sess.endedAt) : '—']) +
+    trow(['<b>Duration</b>', fmtDur(m.totalMs)]) +
+    '</tbody></table>' +
+    '<h2>Pilot Metrics</h2>' +
+    '<table class="ptable"><tbody>' +
+    trow(['<b>Total Rolls Counted</b>', m.rolls]) +
+    trow(['<b>Total Locations</b>', m.locations]) +
+    trow(['<b>Average Count Time / Roll</b>', fmtDur(m.avgMs)]) +
+    trow(['<b>Total Session Time</b>', fmtDur(m.totalMs)]) +
+    trow(['<b>Discrepancies</b>', m.discrepancies]) +
+    trow(['<b>Needs Review</b>', m.needsReview]) +
+    trow(['<b>History Cards Digitized</b>', m.historyCards]) +
+    '</tbody></table>' +
+    '<h2>Count Results</h2>' +
+    '<table class="ptable"><thead><tr><th>Location</th><th>Roll</th><th>Style</th><th>Color</th>' +
+    '<th>Expected</th><th>Measured</th><th>Diff</th><th>MB</th><th>Hist. Card</th><th>Status</th><th>Time</th></tr></thead>' +
+    '<tbody>' + (dataRows || trow(['<i>No rolls counted.</i>'])) + '</tbody></table>' +
+    '<h2>Items Requiring Review</h2>' +
+    '<table class="ptable"><thead><tr><th>Location</th><th>Roll</th><th>Expected</th><th>Measured</th>' +
+    '<th>Diff</th><th>Status</th><th>Note</th></tr></thead>' +
+    '<tbody>' + (discRows || trow(['<i>Nothing needs review.</i>'])) + '</tbody></table>' +
+    '<h2>History Card Documents</h2>' +
+    '<table class="ptable"><thead><tr><th>Roll ID</th><th>Document</th><th>Captured By</th><th>Captured At</th><th>Location</th></tr></thead>' +
+    '<tbody>' + (docRows || trow(['<i>No history cards captured in this session.</i>'])) + '</tbody></table>' +
+    '</div>';
+  return { html: html, mount: function () {
+    $('#back').onclick = function () { history.back(); };
+    $('#doprint').onclick = function () { window.print(); };
+  }};
+};
+
+/* --- DISCOVERED ROLL DETAIL (§7 for never-before-seen rolls) --- */
+Screens['disc-roll'] = function (rollId) {
+  var d = findDiscovered(rollId);
+  if (!d) { setTimeout(function () { history.back(); }, 0); return { html: '' }; }
+  var ddocs = docsForRoll(d.id);
+  var counts = (DB.data.freeCounts || []).filter(function (c) { return c.rollId === d.id; })
+    .sort(function (a, b) { return new Date(b.at) - new Date(a.at); });
+  var countRows = counts.map(function (c) {
+    return '<div class="trow"><div class="mono"><b>' + esc(c.location) + '</b></div>' +
+      '<div class="num">' + fmtLen(c.physicalIn) + '</div>' +
+      '<div>' + statusChip(freeCountStatus(c)) + '</div>' +
+      '<div class="sub">' + esc(c.time) + '</div></div>';
+  }).join('');
+  var html =
+    '<div class="screen">' +
+    '<button class="backbtn" id="back">&larr; BACK</button>' +
+    '<div class="step-head">ROLL DETAIL &mdash; DISCOVERED</div>' +
+    '<h1 class="mono">' + esc(d.id) + '</h1>' +
+    '<div><span class="stchip st-blue">NEWLY DISCOVERED</span></div>' +
+    '<div class="h2">Roll Information</div>' +
+    '<div class="card">' +
+    '<div class="kv"><span class="k">Barcode</span><span class="v mono">' + esc(d.id) + '</span></div>' +
+    '<div class="kv"><span class="k">Current Location</span><span class="v mono">' + esc(d.lastLocation || '—') + '</span></div>' +
+    '<div class="kv"><span class="k">Measured Balance</span><span class="v num">' +
+      (d.lastMeasuredIn != null ? fmtLen(d.lastMeasuredIn) : '—') + ' ✓</span></div>' +
+    '<div class="kv"><span class="k">Style / Color</span><span class="v" style="color:var(--muted)">NOT YET IMPORTED</span></div>' +
+    '<div class="kv"><span class="k">First Seen</span><span class="v">' + esc(d.firstSeenBy || '—') + ' &middot; ' + fmtDT(d.firstSeenAt) + '</span></div>' +
+    '</div>' +
+    '<div class="h2">History Card Images</div>' +
+    (ddocs.length ? docsHtml(ddocs) : '<div class="hint center">No history cards captured for this roll.</div>') +
+    '<div class="h2">Cycle Counts</div>' +
+    '<div class="thead trow"><div>LOCATION</div><div>MEASURED</div><div>STATUS</div><div>TIME</div></div>' +
+    (countRows || '<div class="hint center">No counts recorded.</div>') +
+    '</div>';
+  return { html: html, mount: function () {
+    $('#back').onclick = function () { history.back(); };
     wireDocViews();
   }};
 };
@@ -1945,7 +2471,10 @@ function saveDocument() {
     location: D.location || null,
     source: 'PAPER CARD',
     num: docsForRoll(D.rollId).length + 1,
-    imports: [] /* confirmed smart-extractions, added later via doc-extract */
+    imports: [], /* confirmed smart-extractions, added later via doc-extract */
+    /* Pilot session link: which count session this card was digitized in.
+       Stamped only when a Free Run session is active; otherwise null. */
+    sessionId: (typeof F !== 'undefined' && F && F.id && !F.endedAt) ? F.id : null
   };
   DB.data.documents.push(rec);
   try { persistOrThrow(); }
