@@ -1637,6 +1637,28 @@ Screens['free-loc'] = function () {
   }
 };
 
+/* Custom confirm modal. Returns a Promise<boolean>. Tapping outside the
+   dialog counts as cancel. */
+function showConfirm(opts) {
+  return new Promise(function (resolve) {
+    var ov = document.createElement('div');
+    ov.className = 'modal-ov';
+    ov.innerHTML =
+      '<div class="modal" role="dialog" aria-modal="true">' +
+      '<div class="modal-title">' + esc(opts.title || 'ARE YOU SURE?') + '</div>' +
+      (opts.body ? '<div class="modal-body">' + esc(opts.body) + '</div>' : '') +
+      '<div class="btn-row">' +
+      '<button class="btn" id="m-cancel" style="flex:1">' + esc(opts.cancelLabel || 'CANCEL') + '</button>' +
+      '<button class="btn btn-primary" id="m-ok" style="flex:1">' + esc(opts.okLabel || 'OK') + '</button>' +
+      '</div></div>';
+    document.body.appendChild(ov);
+    function done(v) { ov.remove(); resolve(v); }
+    ov.querySelector('#m-cancel').onclick = function () { done(false); };
+    ov.querySelector('#m-ok').onclick = function () { done(true); };
+    ov.onclick = function (e) { if (e.target === ov) done(false); };
+  });
+}
+
 /* --- STEP 2: scan ANY roll at the active location --- */
 function freeBanner() {
   var m = F && F.lastMsg;
@@ -1682,14 +1704,20 @@ Screens['free-scan'] = function () {
       c.onclick = function () { onCode(c.getAttribute('data-code')); };
     });
     $('#fchangeloc').onclick = function () { go('free-loc'); };
-    /* §4: confirm before finishing — CANCEL / FINISH. */
+    /* §4: confirm before finishing — CANCEL / FINISH. Custom modal, not the
+       native confirm(): native dialogs can't show a FINISH button and are
+       auto-dismissed by headless/automated browsers. */
     $('#fend').onclick = function () {
       var n = freeCountsFor(F.id).length;
-      if (confirm('FINISH THIS CYCLE COUNT?\n\n' + n + ' roll' + (n === 1 ? '' : 's') +
-          ' collected in session ' + F.id + '.\n\nCANCEL to keep counting, FINISH to end the session.'))
-        endFreeSession();
+      showConfirm({
+        title: 'FINISH THIS CYCLE COUNT?',
+        body: n + ' roll' + (n === 1 ? '' : 's') + ' collected in session ' + F.id +
+              '. CANCEL keeps counting; FINISH ends the session.',
+        okLabel: 'FINISH', cancelLabel: 'CANCEL'
+      }).then(function (ok) { if (ok) endFreeSession(); });
     };
   }};
+
   function onCode(code) {
     var raw = String(code || '').trim();
     if (!raw) {
